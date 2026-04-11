@@ -1,0 +1,555 @@
+"""
+FastAPI 웹 애플리케이션
+"""
+
+import logging
+import threading
+from datetime import datetime, timedelta
+from typing import Optional, List
+from fastapi import FastAPI, Request, Depends, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+import pytz
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database.models import (init_db, get_db, ScanResult, ScanLog,
+                              Account, Transaction, Holding, WatchList)
+from scanner.scan_engine import run_scan, scan_status
+from scheduler import start_scheduler, stop_scheduler, get_next_run_times
+from notifications.telegram import test_telegram
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+logger = logging.getLogger(__name__)
+KST = pytz.timezone("Asia/Seoul")
+
+app = FastAPI(title="Weinstein Stock Scanner", version="1.0.0")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+
+static_dir = os.path.join(BASE_DIR, "static")
+os.makedirs(static_dir, exist_ok=True)
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+    start_scheduler()
+    logger.info("앱 시작 완료")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    stop_scheduler()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  페이지
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+# ═══════════════════════════════════════════════════════════════
+#  스캔 API
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/api/scan/start")
+async def start_scan(background_tasks: BackgroundTasks, market: str = "ALL"):
+    if scan_status["is_running"]:
+        return JSONResponse({"status": "already_running", "message": "스캔이 이미 진행 중입니다."})
+
+    def _run():
+        run_scan(market=market, triggered_by="manual")
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "market": market, "message": f"{market} 스캔을 시작했습니다."}
+
+
+@app.get("/api/scan/status")
+async def get_scan_status():
+    now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    return {**scan_status, "now_kst": now_kst, "next_schedules": get_next_run_times()}
+
+
+@app.get("/api/results")
+async def get_results(market: str = "ALL", signal_type: str = "ALL",
+                      days: int = 7, limit: int = 200, db: Session = Depends(get_db)):
+    since_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    q = db.query(ScanResult).filter(ScanResult.signal_date >= since_str)
+    if market != "ALL":
+        q = q.filter(ScanResult.market == market)
+    if signal_type != "ALL":
+        q = q.filter(ScanResult.signal_type == signal_type)
+    rows = q.order_by(ScanResult.signal_date.desc(), ScanResult.scan_time.desc()).limit(limit).all()
+    return [{"id": r.id, "scan_time": r.scan_time.isoformat(),
+             "market": r.market, "ticker": r.ticker, "name": r.name,
+             "signal_type": r.signal_type, "stage": r.stage,
+             "price": r.price, "ma150": r.ma150,
+             "volume_ratio": r.volume_ratio, "signal_date": r.signal_date}
+            for r in rows]
+
+
+@app.delete("/api/results/{result_id}")
+async def delete_result(result_id: int, db: Session = Depends(get_db)):
+    r = db.query(ScanResult).filter(ScanResult.id == result_id).first()
+    if not r:
+        raise HTTPException(status_code=404, detail="결과를 찾을 수 없습니다.")
+    db.delete(r)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@app.get("/api/scan/logs")
+async def get_scan_logs(limit: int = 20, db: Session = Depends(get_db)):
+    logs = db.query(ScanLog).order_by(ScanLog.started_at.desc()).limit(limit).all()
+    return [{"id": l.id,
+             "started_at": l.started_at.isoformat() if l.started_at else None,
+             "finished_at": l.finished_at.isoformat() if l.finished_at else None,
+             "market": l.market, "total_scanned": l.total_scanned,
+             "signals_found": l.signals_found, "status": l.status,
+             "triggered_by": l.triggered_by, "error_msg": l.error_msg}
+            for l in logs]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  계좌 API
+# ═══════════════════════════════════════════════════════════════
+
+ACCOUNT_TYPE_CURRENCY = {
+    "KR_STOCK":  "KRW",
+    "US_STOCK":  "USD",
+    "KR_PENSION": "KRW",
+    "KR_IRP":    "KRW",
+    "KR_ISA":    "KRW",
+    "OTHER":     "KRW",
+}
+
+ACCOUNT_TYPE_LABEL = {
+    "KR_STOCK":  "국내주식",
+    "US_STOCK":  "해외주식",
+    "KR_PENSION": "연금저축",
+    "KR_IRP":    "IRP",
+    "KR_ISA":    "ISA",
+    "OTHER":     "기타",
+}
+
+
+class AccountCreate(BaseModel):
+    name: str
+    account_type: str = "KR_STOCK"
+    broker: str = ""
+    memo: str = ""
+
+
+@app.get("/api/accounts")
+async def list_accounts(db: Session = Depends(get_db)):
+    accounts = db.query(Account).filter(Account.is_active == True).all()
+    result = []
+    for a in accounts:
+        currency = ACCOUNT_TYPE_CURRENCY.get(a.account_type, a.currency or "KRW")
+        cash = _calc_cash(a.id, db)
+        stock_eval = sum(
+            (h.current_price or h.avg_price) * h.quantity
+            for h in db.query(Holding).filter(
+                Holding.account_id == a.id, Holding.is_active == True, Holding.quantity > 0
+            ).all()
+        )
+        result.append({
+            "id": a.id,
+            "name": a.name,
+            "account_type": a.account_type or "KR_STOCK",
+            "account_type_label": ACCOUNT_TYPE_LABEL.get(a.account_type, "기타"),
+            "currency": currency,
+            "broker": a.broker or "",
+            "memo": a.memo,
+            "cash": round(cash, 2),
+            "stock_eval": round(stock_eval, 2),
+            "total": round(cash + stock_eval, 2),
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+        })
+    return result
+
+
+@app.post("/api/accounts")
+async def create_account(body: AccountCreate, db: Session = Depends(get_db)):
+    currency = ACCOUNT_TYPE_CURRENCY.get(body.account_type, "KRW")
+    a = Account(name=body.name, account_type=body.account_type,
+                currency=currency, broker=body.broker, memo=body.memo)
+    db.add(a)
+    db.commit()
+    db.refresh(a)
+    return {"status": "created", "id": a.id}
+
+
+@app.delete("/api/accounts/{account_id}")
+async def delete_account(account_id: int, db: Session = Depends(get_db)):
+    a = db.query(Account).filter(Account.id == account_id).first()
+    if not a:
+        raise HTTPException(status_code=404, detail="계좌를 찾을 수 없습니다.")
+    a.is_active = False
+    db.commit()
+    return {"status": "deleted"}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  거래 API  (매수/매도/입금/출금)
+# ═══════════════════════════════════════════════════════════════
+
+class TxCreate(BaseModel):
+    account_id: int
+    tx_type: str          # BUY / SELL / DEPOSIT / WITHDRAW
+    trade_date: str       # YYYY-MM-DD
+    ticker: Optional[str] = None
+    name: Optional[str] = None
+    market: Optional[str] = None
+    quantity: Optional[float] = None
+    price: Optional[float] = None
+    amount: float
+    fee: float = 0
+    tax: float = 0
+    memo: str = ""
+
+
+@app.get("/api/transactions")
+async def list_transactions(account_id: Optional[int] = None,
+                            tx_type: str = "ALL", limit: int = 200,
+                            db: Session = Depends(get_db)):
+    q = db.query(Transaction)
+    if account_id:
+        q = q.filter(Transaction.account_id == account_id)
+    if tx_type != "ALL":
+        q = q.filter(Transaction.tx_type == tx_type)
+    rows = q.order_by(Transaction.trade_date.desc(), Transaction.id.desc()).limit(limit).all()
+    return [_tx_to_dict(t) for t in rows]
+
+
+@app.post("/api/transactions")
+async def create_transaction(body: TxCreate, db: Session = Depends(get_db)):
+    acct = db.query(Account).filter(Account.id == body.account_id).first()
+    if not acct:
+        raise HTTPException(status_code=404, detail="계좌를 찾을 수 없습니다.")
+
+    tx = Transaction(**body.dict())
+    db.add(tx)
+
+    # 매수 → 보유 주식 업데이트 (평단가 재계산)
+    if body.tx_type == "BUY" and body.ticker and body.quantity and body.price:
+        _apply_buy(db, body.account_id, body.ticker, body.name or "",
+                   body.market or "KR", body.quantity, body.price)
+
+    # 매도 → 보유 수량 차감
+    elif body.tx_type == "SELL" and body.ticker and body.quantity:
+        _apply_sell(db, body.account_id, body.ticker, body.quantity)
+
+    db.commit()
+    db.refresh(tx)
+    return {"status": "created", "id": tx.id}
+
+
+@app.delete("/api/transactions/{tx_id}")
+async def delete_transaction(tx_id: int, db: Session = Depends(get_db)):
+    tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="거래 내역을 찾을 수 없습니다.")
+    account_id, ticker, tx_type = tx.account_id, tx.ticker, tx.tx_type
+    db.delete(tx)
+    db.flush()
+    # 매수/매도 삭제 시 보유주식 재계산
+    if tx_type in ("BUY", "SELL") and ticker:
+        _recalc_holding(db, account_id, ticker)
+    db.commit()
+    return {"status": "deleted"}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  보유 주식 API
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/holdings")
+async def list_holdings(account_id: Optional[int] = None, db: Session = Depends(get_db)):
+    q = db.query(Holding).filter(Holding.is_active == True, Holding.quantity > 0)
+    if account_id:
+        q = q.filter(Holding.account_id == account_id)
+    holdings = q.all()
+    return [_holding_to_dict(h) for h in holdings]
+
+
+@app.delete("/api/holdings/{holding_id}")
+async def delete_holding(holding_id: int, db: Session = Depends(get_db)):
+    h = db.query(Holding).filter(Holding.id == holding_id).first()
+    if not h:
+        raise HTTPException(status_code=404, detail="보유주식을 찾을 수 없습니다.")
+    db.delete(h)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@app.post("/api/holdings/recalc-all")
+async def recalc_all_holdings(db: Session = Depends(get_db)):
+    """모든 계좌·종목의 보유수량·평단가를 거래내역 기준으로 재계산"""
+    from sqlalchemy import text
+    pairs = db.execute(text(
+        "SELECT DISTINCT account_id, ticker FROM transactions WHERE tx_type IN ('BUY','SELL') AND ticker IS NOT NULL"
+    )).fetchall()
+    for account_id, ticker in pairs:
+        _recalc_holding(db, account_id, ticker)
+    db.commit()
+    return {"status": "ok", "recalculated": len(pairs)}
+
+
+@app.post("/api/holdings/refresh-prices")
+async def refresh_prices(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """보유 주식 현재가 일괄 업데이트"""
+    def _refresh():
+        _update_holding_prices()
+    background_tasks.add_task(_refresh)
+    return {"status": "started", "message": "현재가 업데이트를 시작했습니다."}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  감시 목록 (Weinstein 매도 시그널용)
+# ═══════════════════════════════════════════════════════════════
+
+class WatchCreate(BaseModel):
+    ticker: str
+    name: str
+    market: str
+    buy_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    target_price: Optional[float] = None
+    memo: str = ""
+
+
+@app.get("/api/watchlist")
+async def get_watchlist(db: Session = Depends(get_db)):
+    items = db.query(WatchList).filter(WatchList.is_active == True).all()
+    return [{"id": w.id, "ticker": w.ticker, "name": w.name, "market": w.market,
+             "buy_price": w.buy_price, "stop_loss": w.stop_loss,
+             "target_price": w.target_price, "memo": w.memo,
+             "created_at": w.created_at.isoformat() if w.created_at else None}
+            for w in items]
+
+
+@app.post("/api/watchlist")
+async def add_watchlist(body: WatchCreate, db: Session = Depends(get_db)):
+    existing = db.query(WatchList).filter(WatchList.ticker == body.ticker).first()
+    if existing:
+        for k, v in body.dict().items():
+            setattr(existing, k, v)
+        existing.is_active = True
+        db.commit()
+        return {"status": "updated", "id": existing.id}
+    item = WatchList(**body.dict())
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"status": "created", "id": item.id}
+
+
+@app.delete("/api/watchlist/{ticker}")
+async def remove_watchlist(ticker: str, db: Session = Depends(get_db)):
+    item = db.query(WatchList).filter(WatchList.ticker == ticker).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="종목을 찾을 수 없습니다.")
+    item.is_active = False
+    db.commit()
+    return {"status": "removed"}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  텔레그램 / 설정
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/telegram/test")
+async def telegram_test():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return {"status": "error", "message": ".env 파일에서 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID를 설정하세요."}
+    ok = test_telegram()
+    return {"status": "ok" if ok else "error",
+            "message": "테스트 메시지를 발송했습니다." if ok else "발송 실패 - 토큰/Chat ID를 확인하세요."}
+
+
+@app.get("/api/market/status")
+async def get_market_status(force: bool = False):
+    """미국·한국 지수 Stage 분석 (Forest to Trees)"""
+    try:
+        from scanner.market_analysis import get_market_stages
+        return get_market_stages(force=force)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/exchange-rate")
+async def get_exchange_rate():
+    """USD/KRW 환율 (yfinance USDKRW=X)"""
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker("USDKRW=X")
+        hist = ticker.history(period="5d")
+        if hist is not None and len(hist) > 0:
+            rate = float(hist["Close"].iloc[-1])
+            return {"rate": round(rate, 2), "base": "USD", "quote": "KRW"}
+    except Exception:
+        pass
+    return {"rate": 1380.0, "base": "USD", "quote": "KRW"}  # fallback
+
+
+@app.get("/api/settings")
+async def get_settings():
+    from config import SCAN_LOOKBACK_DAYS, MA_PERIOD, VOLUME_SURGE_RATIO, SCHEDULE_TIMES, US_UNIVERSE
+    return {
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "scan_lookback_days": SCAN_LOOKBACK_DAYS,
+        "ma_period": MA_PERIOD,
+        "volume_surge_ratio": VOLUME_SURGE_RATIO,
+        "schedule_times": SCHEDULE_TIMES,
+        "us_universe": US_UNIVERSE,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  내부 헬퍼
+# ═══════════════════════════════════════════════════════════════
+
+def _calc_cash(account_id: int, db: Session) -> float:
+    txs = db.query(Transaction).filter(Transaction.account_id == account_id).all()
+    bal = 0.0
+    for t in txs:
+        if t.tx_type == "DEPOSIT":
+            bal += t.amount
+        elif t.tx_type == "WITHDRAW":
+            bal -= t.amount
+        elif t.tx_type == "BUY":
+            bal -= t.amount + (t.fee or 0)
+        elif t.tx_type == "SELL":
+            bal += t.amount - (t.fee or 0) - (t.tax or 0)
+    return round(bal, 2)
+
+
+def _apply_buy(db: Session, account_id: int, ticker: str, name: str,
+               market: str, quantity: float, price: float):
+    """매수 시 보유 주식 평단가 재계산 (이동평균 방식)"""
+    h = db.query(Holding).filter(
+        Holding.account_id == account_id,
+        Holding.ticker == ticker,
+        Holding.is_active == True
+    ).first()
+    if h:
+        total_qty = h.quantity + quantity
+        h.avg_price = round((h.avg_price * h.quantity + price * quantity) / total_qty, 4)
+        h.quantity = total_qty
+    else:
+        h = Holding(account_id=account_id, ticker=ticker, name=name,
+                    market=market, quantity=quantity, avg_price=price)
+        db.add(h)
+
+
+def _recalc_holding(db: Session, account_id: int, ticker: str):
+    """남은 BUY/SELL 거래 기반으로 보유 수량·평단가 재계산"""
+    txs = db.query(Transaction).filter(
+        Transaction.account_id == account_id,
+        Transaction.ticker == ticker,
+        Transaction.tx_type.in_(["BUY", "SELL"])
+    ).order_by(Transaction.trade_date, Transaction.id).all()
+
+    qty, cost = 0.0, 0.0
+    for t in txs:
+        if t.tx_type == "BUY" and t.quantity and t.price:
+            cost = (cost / qty * qty + t.price * t.quantity) / (qty + t.quantity) if qty > 0 else t.price
+            qty += t.quantity
+        elif t.tx_type == "SELL" and t.quantity:
+            qty = max(0, qty - t.quantity)
+            if qty == 0:
+                cost = 0.0
+
+    h = db.query(Holding).filter(
+        Holding.account_id == account_id, Holding.ticker == ticker
+    ).first()
+    if qty > 0:
+        if h:
+            h.quantity = qty
+            h.avg_price = round(cost, 4)
+            h.is_active = True
+        else:
+            h = Holding(account_id=account_id, ticker=ticker,
+                        quantity=qty, avg_price=round(cost, 4), is_active=True)
+            db.add(h)
+    else:
+        if h:
+            h.quantity = 0
+            h.is_active = False
+
+
+def _apply_sell(db: Session, account_id: int, ticker: str, quantity: float):
+    """매도 시 보유 수량 차감"""
+    h = db.query(Holding).filter(
+        Holding.account_id == account_id,
+        Holding.ticker == ticker,
+        Holding.is_active == True
+    ).first()
+    if h:
+        h.quantity = max(0, h.quantity - quantity)
+        if h.quantity == 0:
+            h.is_active = False
+
+
+def _update_holding_prices():
+    """보유 주식 현재가 일괄 업데이트"""
+    from scanner.kr_stocks import get_kr_ohlcv
+    from scanner.us_stocks import get_us_ohlcv
+    db = SessionLocal() if False else next(get_db())
+    try:
+        from database.models import SessionLocal as SL
+        db = SL()
+        holdings = db.query(Holding).filter(
+            Holding.is_active == True, Holding.quantity > 0
+        ).all()
+        for h in holdings:
+            try:
+                df = get_kr_ohlcv(h.ticker) if h.market == "KR" else get_us_ohlcv(h.ticker)
+                if df is not None and len(df) > 0:
+                    h.current_price = float(df["Close"].iloc[-1])
+                    h.price_updated_at = datetime.utcnow()
+            except Exception:
+                pass
+        db.commit()
+    finally:
+        db.close()
+
+
+def _tx_to_dict(t: Transaction) -> dict:
+    return {
+        "id": t.id, "account_id": t.account_id,
+        "tx_type": t.tx_type, "trade_date": t.trade_date,
+        "ticker": t.ticker, "name": t.name, "market": t.market,
+        "quantity": t.quantity, "price": t.price, "amount": t.amount,
+        "fee": t.fee, "tax": t.tax, "memo": t.memo,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    }
+
+
+def _holding_to_dict(h: Holding) -> dict:
+    cp = h.current_price or h.avg_price
+    eval_amt = round(cp * h.quantity, 2) if cp else 0
+    pl = round((cp - h.avg_price) * h.quantity, 2) if h.current_price else 0
+    pl_pct = round((cp - h.avg_price) / h.avg_price * 100, 2) if h.current_price and h.avg_price else 0
+    return {
+        "id": h.id, "account_id": h.account_id,
+        "ticker": h.ticker, "name": h.name, "market": h.market,
+        "quantity": h.quantity, "avg_price": h.avg_price,
+        "current_price": h.current_price,
+        "eval_amount": eval_amt,
+        "profit_loss": pl,
+        "profit_loss_pct": pl_pct,
+        "price_updated_at": h.price_updated_at.isoformat() if h.price_updated_at else None,
+        "memo": h.memo,
+    }
