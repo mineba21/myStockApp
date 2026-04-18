@@ -30,6 +30,7 @@ class ScanResult(Base):
     volume = Column(Float)
     volume_avg = Column(Float)
     volume_ratio = Column(Float)
+    grade = Column(String(5), default="B")
     signal_date = Column(String(10))          # YYYY-MM-DD
     notified = Column(Boolean, default=False)
 
@@ -178,7 +179,7 @@ def init_db():
 def _migrate():
     """기존 DB에 새 컬럼이 없으면 추가 (ALTER TABLE)"""
     with engine.connect() as conn:
-        existing = {row[1] for row in conn.execute(
+        existing_accounts = {row[1] for row in conn.execute(
             engine.dialect.get_columns.__func__ and
             __import__('sqlalchemy').text("PRAGMA table_info(accounts)")
         )}
@@ -186,12 +187,24 @@ def _migrate():
             ("account_type", "ALTER TABLE accounts ADD COLUMN account_type VARCHAR(20) DEFAULT 'KR_STOCK'"),
             ("broker",       "ALTER TABLE accounts ADD COLUMN broker VARCHAR(50) DEFAULT ''"),
         ]:
-            if col not in existing:
+            if col not in existing_accounts:
                 try:
                     conn.execute(__import__('sqlalchemy').text(ddl))
                     conn.commit()
                 except Exception:
                     pass
+
+        existing_scan = {row[1] for row in conn.execute(
+            __import__('sqlalchemy').text("PRAGMA table_info(scan_results)")
+        )}
+        if "grade" not in existing_scan:
+            try:
+                conn.execute(__import__('sqlalchemy').text(
+                    "ALTER TABLE scan_results ADD COLUMN grade VARCHAR(5) DEFAULT 'B'"
+                ))
+                conn.commit()
+            except Exception:
+                pass
 
 
 def get_db():

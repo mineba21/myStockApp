@@ -135,9 +135,32 @@ def _check_watchlist(db):
     return sells
 
 
+def _grade(signal: dict) -> str:
+    """
+    Signal quality grade.
+    S: BREAKOUT + base_quality=STRONG + volume_ratio >= 2.0
+    A: BREAKOUT + base_quality=WEAK or volume_ratio >= 1.5
+    B: RE_BREAKOUT or REBOUND
+    """
+    try:
+        st = signal.get("signal_type")
+        v = float(signal.get("volume_ratio", 0) or 0)
+        bq = signal.get("base_quality", "NONE")
+        if st == "BREAKOUT" and bq == "STRONG" and v >= 2.0:
+            return "S"
+        if st == "BREAKOUT" and (bq == "WEAK" or v >= 1.5):
+            return "A"
+        if st in ("RE_BREAKOUT", "REBOUND"):
+            return "B"
+    except Exception:
+        pass
+    return "B"
+
+
 def _save(db, signal: dict):
     from database.models import ScanResult
     try:
+        grade = _grade(signal)
         # 같은 ticker + signal_date + signal_type 중복 저장 방지
         existing = db.query(ScanResult).filter(
             ScanResult.ticker == signal["ticker"],
@@ -149,6 +172,7 @@ def _save(db, signal: dict):
             existing.price = signal["price"]
             existing.ma150 = signal["ma150"]
             existing.volume_ratio = signal.get("volume_ratio", 0)
+            existing.grade = grade
             existing.scan_time = datetime.utcnow()
         else:
             db.add(ScanResult(
@@ -158,6 +182,7 @@ def _save(db, signal: dict):
                 price=signal["price"], ma150=signal["ma150"],
                 volume=signal.get("volume", 0), volume_avg=signal.get("volume_avg", 0),
                 volume_ratio=signal.get("volume_ratio", 0),
+                grade=grade,
                 signal_date=signal.get("signal_date", ""),
             ))
         db.commit()
@@ -167,16 +192,48 @@ def _save(db, signal: dict):
 
 def _notify(buys, sells, send_fn):
     if buys:
+        from scanner.market_analysis import get_market_stages
+
+        def _badge(g: str) -> str:
+            return {"S": "🔥", "A": "✅", "B": "📌"}.get(g, "📌")
+
+        def _sector_line(sectors: list) -> str:
+            try:
+                strong = [f"{s['name']}(S2)" for s in sectors if s.get("stage") == "STAGE2"]
+                weak = [f"{s['name']}(S4)" for s in sectors if s.get("stage") == "STAGE4"]
+                if not strong and not weak:
+                    return ""
+                left = " ".join(strong[:3]) if strong else "-"
+                right = " ".join(weak[:3]) if weak else "-"
+                return f"📊 강세 섹터: {left} | 약세: {right}\n"
+            except Exception:
+                return ""
+
+        sectors = {}
+        try:
+            sectors = get_market_stages()
+        except Exception as e:
+            logger.debug(f"시장 섹터 조회 실패: {e}")
+
         kr = [s for s in buys if s["market"] == "KR"]
         us = [s for s in buys if s["market"] == "US"]
         msg = f"📈 *Weinstein Stage2 매수 시그널*\n🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')} KST\n\n"
         for mkt_list, flag in ((kr, "🇰🇷"), (us, "🇺🇸")):
             if not mkt_list: continue
             msg += f"{flag} *{'한국' if flag=='🇰🇷' else '미국'} 주식*\n"
+            if flag == "🇰🇷":
+                msg += _sector_line(sectors.get("KR_SECTORS", []))
+            else:
+                msg += _sector_line(sectors.get("US_SECTORS", []))
             for s in mkt_list[:10]:
                 ico = "🚀" if s["signal_type"] == "BREAKOUT" else "🔄"
+                grade = _grade(s)
                 p   = f"{s['price']:,.0f}원" if s["market"] == "KR" else f"${s['price']:.2f}"
-                msg += f"{ico} *{s['name']}* ({s['ticker']})\n  • {s['signal_type']} | {p} | 거래량 {s['volume_ratio']:.1f}x\n  • 시그널일: {s['signal_date']}\n\n"
+                msg += (
+                    f"{_badge(grade)} {ico} *{s['name']}* ({s['ticker']})\n"
+                    f"  • {s['signal_type']} | 등급 {grade} | {p} | 거래량 {s['volume_ratio']:.1f}x\n"
+                    f"  • 시그널일: {s['signal_date']}\n\n"
+                )
             if len(mkt_list) > 10:
                 msg += f"  ... 외 {len(mkt_list)-10}개\n\n"
         send_fn(msg)

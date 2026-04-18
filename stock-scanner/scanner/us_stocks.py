@@ -18,6 +18,7 @@ _HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+EXCLUDE_US = ['GOOGL']
 
 
 def _read_html_wiki(url: str) -> list:
@@ -71,6 +72,7 @@ def get_all_us_tickers(universe: str = "sp500+nasdaq100") -> list:
     if "nasdaq100" in universe:
         for t in get_nasdaq100_tickers():
             if t["ticker"] not in seen: tickers.append(t); seen.add(t["ticker"])
+    tickers = [t for t in tickers if t.get("ticker") not in EXCLUDE_US]
     _cache = tickers
     return tickers
 
