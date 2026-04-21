@@ -23,7 +23,7 @@ class ScanResult(Base):
     market = Column(String(10), index=True)   # KR / US
     ticker = Column(String(20), index=True)
     name = Column(String(100))
-    signal_type = Column(String(20))          # BREAKOUT / REBOUND
+    signal_type = Column(String(20))          # BREAKOUT / RE_BREAKOUT / REBOUND
     stage = Column(String(10))
     price = Column(Float)
     ma150 = Column(Float)
@@ -32,6 +32,13 @@ class ScanResult(Base):
     volume_ratio = Column(Float)
     signal_date = Column(String(10))          # YYYY-MM-DD
     notified = Column(Boolean, default=False)
+    # ── 확장 메타데이터 (nullable) ──────────────────────────────
+    pivot_price      = Column(Float,       nullable=True)   # 돌파 기준 pivot 가격
+    support_level    = Column(Float,       nullable=True)   # MA50 지지선
+    market_condition = Column(String(20),  nullable=True)   # BULL/BEAR/CAUTION/NEUTRAL
+    signal_quality   = Column(String(10),  nullable=True)   # STRONG/MODERATE/WEAK
+    rs_value         = Column(Float,       nullable=True)   # 상대강도 값
+    grade            = Column(String(5),   nullable=True)   # S/A/B 종합 등급
 
 
 class ScanLog(Base):
@@ -177,19 +184,36 @@ def init_db():
 
 def _migrate():
     """기존 DB에 새 컬럼이 없으면 추가 (ALTER TABLE)"""
+    from sqlalchemy import text as _text
     with engine.connect() as conn:
-        existing = {row[1] for row in conn.execute(
-            engine.dialect.get_columns.__func__ and
-            __import__('sqlalchemy').text("PRAGMA table_info(accounts)")
-        )}
+        def _existing_cols(table):
+            return {row[1] for row in conn.execute(_text(f"PRAGMA table_info({table})"))}
+
+        # accounts 테이블
+        acct_cols = _existing_cols("accounts")
         for col, ddl in [
             ("account_type", "ALTER TABLE accounts ADD COLUMN account_type VARCHAR(20) DEFAULT 'KR_STOCK'"),
             ("broker",       "ALTER TABLE accounts ADD COLUMN broker VARCHAR(50) DEFAULT ''"),
         ]:
-            if col not in existing:
+            if col not in acct_cols:
                 try:
-                    conn.execute(__import__('sqlalchemy').text(ddl))
-                    conn.commit()
+                    conn.execute(_text(ddl)); conn.commit()
+                except Exception:
+                    pass
+
+        # scan_results 테이블 — 새 메타데이터 컬럼
+        sr_cols = _existing_cols("scan_results")
+        for col, ddl in [
+            ("pivot_price",      "ALTER TABLE scan_results ADD COLUMN pivot_price REAL"),
+            ("support_level",    "ALTER TABLE scan_results ADD COLUMN support_level REAL"),
+            ("market_condition", "ALTER TABLE scan_results ADD COLUMN market_condition VARCHAR(20)"),
+            ("signal_quality",   "ALTER TABLE scan_results ADD COLUMN signal_quality VARCHAR(10)"),
+            ("rs_value",         "ALTER TABLE scan_results ADD COLUMN rs_value REAL"),
+            ("grade",            "ALTER TABLE scan_results ADD COLUMN grade VARCHAR(5)"),
+        ]:
+            if col not in sr_cols:
+                try:
+                    conn.execute(_text(ddl)); conn.commit()
                 except Exception:
                     pass
 

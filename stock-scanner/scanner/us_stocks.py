@@ -1,4 +1,4 @@
-"""미국 주식 데이터 (S&P500 + NASDAQ100) - yfinance"""
+"""미국 주식 데이터 - yfinance / FinanceDataReader"""
 import io
 import pandas as pd
 import yfinance as yf
@@ -8,7 +8,10 @@ import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-_cache: list = []
+_cache: dict = {}   # universe_key → list
+
+# SP500/NASDAQ100 중복 등록되는 대표 심볼 제외 (BRK-B=BRK-A 등)
+EXCLUDE_US: set = {"GOOGL"}   # GOOG 와 중복; 필요 시 추가
 
 _HEADERS = {
     "User-Agent": (
@@ -60,18 +63,66 @@ def get_nasdaq100_tickers() -> list:
     return []
 
 
+def get_nyse_tickers() -> list:
+    """NYSE 전체 상장 종목 (FinanceDataReader)"""
+    try:
+        import FinanceDataReader as fdr
+        df = fdr.StockListing('NYSE')
+        return [{"ticker": str(r["Symbol"]).replace(".", "-"),
+                 "name": str(r["Name"]), "market_type": "NYSE"}
+                for _, r in df.iterrows()
+                if str(r["Symbol"]).isalpha() and len(str(r["Symbol"])) <= 5]
+    except Exception as e:
+        logger.error(f"NYSE 목록 실패: {e}"); return []
+
+
+def get_nasdaq_tickers() -> list:
+    """NASDAQ 전체 상장 종목 (FinanceDataReader)"""
+    try:
+        import FinanceDataReader as fdr
+        df = fdr.StockListing('NASDAQ')
+        return [{"ticker": str(r["Symbol"]).replace(".", "-"),
+                 "name": str(r["Name"]), "market_type": "NASDAQ"}
+                for _, r in df.iterrows()
+                if str(r["Symbol"]).isalpha() and len(str(r["Symbol"])) <= 5]
+    except Exception as e:
+        logger.error(f"NASDAQ 목록 실패: {e}"); return []
+
+
 def get_all_us_tickers(universe: str = "sp500+nasdaq100") -> list:
     global _cache
-    if _cache:
-        return _cache
+    key = universe.lower().strip()
+    if key in _cache:
+        return _cache[key]
+
     seen, tickers = set(), []
-    if "sp500"    in universe:
-        for t in get_sp500_tickers():
-            if t["ticker"] not in seen: tickers.append(t); seen.add(t["ticker"])
-    if "nasdaq100" in universe:
-        for t in get_nasdaq100_tickers():
-            if t["ticker"] not in seen: tickers.append(t); seen.add(t["ticker"])
-    _cache = tickers
+
+    def _add(items):
+        for t in items:
+            if t["ticker"] not in seen and t["ticker"] not in EXCLUDE_US:
+                tickers.append(t)
+                seen.add(t["ticker"])
+
+    use_all = key in ("all", "")
+
+    # S&P500
+    if use_all or "sp500" in key:
+        _add(get_sp500_tickers())
+
+    # NASDAQ100
+    if use_all or "nasdaq100" in key:
+        _add(get_nasdaq100_tickers())
+
+    # NYSE 전체 (sp500/nasdaq100과 중복 제거됨)
+    if use_all or "nyse" in key:
+        _add(get_nyse_tickers())
+
+    # NASDAQ 전체 (sp500/nasdaq100과 중복 제거됨)
+    if use_all or "nasdaq" in key:
+        _add(get_nasdaq_tickers())
+
+    logger.info(f"US 유니버스 [{universe}]: {len(tickers)}개")
+    _cache[key] = tickers
     return tickers
 
 

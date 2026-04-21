@@ -75,14 +75,40 @@
   <!-- 스캔 컨트롤 -->
   <div class="card p-4 mb-4">
     <div class="flex flex-wrap items-center gap-3">
-      <div class="flex gap-1.5">
-        <template x-for="m in ['ALL','KR','US']" :key="m">
-          <button @click="scanMarket=m"
-            :class="scanMarket===m ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'"
-            class="btn">
-            <span x-text="m==='ALL'?'전체':m==='KR'?'🇰🇷 한국':'🇺🇸 미국'"></span>
-          </button>
-        </template>
+
+      <!-- 시장 선택 (KR / US — 동시 스캔 없음) -->
+      <div class="flex gap-1.5 rounded-lg bg-slate-100 p-0.5">
+        <button @click="scanMarket='KR'"
+          :class="scanMarket==='KR' ? 'bg-white shadow text-indigo-700 font-bold' : 'text-slate-500 hover:text-slate-700'"
+          class="btn text-sm px-4 py-1.5 rounded-md transition-all">
+          🇰🇷 한국
+        </button>
+        <button @click="scanMarket='US'"
+          :class="scanMarket==='US' ? 'bg-white shadow text-indigo-700 font-bold' : 'text-slate-500 hover:text-slate-700'"
+          class="btn text-sm px-4 py-1.5 rounded-md transition-all">
+          🇺🇸 미국
+        </button>
+      </div>
+
+      <!-- KR 유니버스 -->
+      <div x-show="scanMarket==='KR'" class="flex items-center gap-1.5">
+        <span class="text-xs text-slate-500">유니버스</span>
+        <select x-model="krUniverse" class="text-xs border border-slate-200 rounded px-2 py-1 bg-white text-slate-700">
+          <option value="kospi+kosdaq">KOSPI + KOSDAQ 전체</option>
+          <option value="kospi">KOSPI 만</option>
+          <option value="kosdaq">KOSDAQ 만</option>
+        </select>
+      </div>
+
+      <!-- US 유니버스 -->
+      <div x-show="scanMarket==='US'" class="flex items-center gap-1.5">
+        <span class="text-xs text-slate-500">유니버스</span>
+        <select x-model="usUniverse" class="text-xs border border-slate-200 rounded px-2 py-1 bg-white text-slate-700">
+          <option value="sp500+nasdaq100">S&P500 + NASDAQ100 (~517개)</option>
+          <option value="nyse">NYSE 전체 (~2,700개)</option>
+          <option value="nasdaq">NASDAQ 전체 (~3,800개)</option>
+          <option value="nyse+nasdaq">NYSE + NASDAQ 전체 (~6,500개)</option>
+        </select>
       </div>
 
       <div class="text-xs text-slate-400 hidden md:flex flex-col">
@@ -188,6 +214,58 @@
       <option value="30">30일</option>
     </select>
     <button @click="loadResults()" class="btn btn-ghost">↺ 새로고침</button>
+    <button x-show="results.length > 0"
+      @click="showBulkDeleteModal = true"
+      class="btn btn-danger ml-auto flex items-center gap-1.5">
+      <span>🗑️</span>
+      <span>일괄 삭제</span>
+      <span class="bg-red-200 text-red-800 text-xs px-1.5 py-0.5 rounded-full font-bold"
+            x-text="results.length + '건'"></span>
+    </button>
+  </div>
+
+  <!-- 일괄 삭제 확인 모달 -->
+  <div x-show="showBulkDeleteModal" x-cloak class="modal-bg" @click.self="showBulkDeleteModal=false">
+    <div class="bg-white rounded-2xl shadow-xl w-full max-w-sm p-6">
+      <div class="text-center mb-5">
+        <div class="text-4xl mb-3">🗑️</div>
+        <h3 class="font-bold text-slate-800 text-lg mb-1">검출 항목 일괄 삭제</h3>
+        <p class="text-sm text-slate-500">현재 필터 조건에 해당하는</p>
+        <p class="text-lg font-bold text-red-600 my-1" x-text="results.length + '건'"></p>
+        <p class="text-sm text-slate-500">을 모두 삭제합니다.</p>
+        <!-- 현재 필터 요약 -->
+        <div class="mt-3 bg-slate-50 rounded-xl p-3 text-xs text-slate-500 text-left space-y-1">
+          <div class="flex justify-between">
+            <span class="text-slate-400">시장</span>
+            <span class="font-medium text-slate-700"
+              x-text="filter.market==='ALL'?'전체':filter.market==='KR'?'🇰🇷 한국':'🇺🇸 미국'"></span>
+          </div>
+          <div class="flex justify-between">
+            <span class="text-slate-400">신호 유형</span>
+            <span class="font-medium text-slate-700"
+              x-text="filter.signal_type==='ALL'?'전체':filter.signal_type==='BREAKOUT'?'🚀 돌파':filter.signal_type==='RE_BREAKOUT'?'🔁 재돌파':'🔄 반등'"></span>
+          </div>
+          <div class="flex justify-between">
+            <span class="text-slate-400">기간</span>
+            <span class="font-medium text-slate-700" x-text="filter.days+'일 이내'"></span>
+          </div>
+        </div>
+        <p class="text-xs text-red-400 mt-3">⚠️ 삭제 후 복구할 수 없습니다</p>
+      </div>
+      <div class="flex gap-2">
+        <button @click="showBulkDeleteModal=false"
+          class="flex-1 btn btn-ghost">취소</button>
+        <button @click="deleteAllResults()"
+          :disabled="bulkDeleting"
+          class="flex-1 btn btn-danger flex items-center justify-center gap-1.5">
+          <svg x-show="bulkDeleting" class="spin w-4 h-4" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path>
+          </svg>
+          <span x-text="bulkDeleting ? '삭제 중…' : '전체 삭제'"></span>
+        </button>
+      </div>
+    </div>
   </div>
 
   <!-- 결과 없음 -->
@@ -1103,13 +1181,17 @@ function app() {
     ],
 
     // 스캔
-    isScanning: false, scanMarket: 'ALL',
+    isScanning: false,
+    scanMarket: 'KR',
+    krUniverse: 'kospi+kosdaq',
+    usUniverse: 'sp500+nasdaq100',
     scanProg: {progress:0,total:0,current_stock:''},
     results: [], scanLogs: [], nextSchedules: [],
     filter: {market:'ALL', signal_type:'ALL', days:7},
     stats: {buy:0,breakout:0,rebreakout:0,rebound:0,kr:0,us:0},
     marketStatus: {},
     settings: {},
+    showBulkDeleteModal: false, bulkDeleting: false,
 
     // 계좌
     accounts: [], selectedAccountId: null,
@@ -1188,7 +1270,8 @@ function app() {
     async startScan() {
       if (this.isScanning) return;
       try {
-        const d = await (await fetch(`/api/scan/start?market=${this.scanMarket}`,{method:'POST'})).json();
+        const universe = this.scanMarket === 'KR' ? this.krUniverse : this.usUniverse;
+        const d = await (await fetch(`/api/scan/start?market=${this.scanMarket}&universe=${universe}`,{method:'POST'})).json();
         if (d.status==='started') { this.isScanning=true; this.toast(d.message,'success'); }
         else this.toast(d.message||'오류','error');
       } catch { this.toast('서버 오류','error'); }
@@ -1211,6 +1294,25 @@ function app() {
       const r = await fetch(`/api/results/${id}`, {method:'DELETE'});
       if (r.ok) { this.results = this.results.filter(x=>x.id!==id); this.toast('삭제됐습니다','success'); }
       else this.toast('삭제 실패','error');
+    },
+
+    async deleteAllResults() {
+      if (this.bulkDeleting) return;
+      this.bulkDeleting = true;
+      try {
+        const {market, signal_type, days} = this.filter;
+        const url = `/api/results?market=${market}&signal_type=${signal_type}&days=${days}`;
+        const r = await fetch(url, {method:'DELETE'});
+        if (r.ok) {
+          const d = await r.json();
+          this.showBulkDeleteModal = false;
+          await this.loadResults();
+          this.toast(`${d.count}건 삭제 완료`, 'success');
+        } else {
+          this.toast('삭제 실패', 'error');
+        }
+      } catch { this.toast('서버 오류', 'error'); }
+      finally { this.bulkDeleting = false; }
     },
 
     async loadScanLogs() {

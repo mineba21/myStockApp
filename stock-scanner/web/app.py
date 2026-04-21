@@ -63,12 +63,12 @@ async def index(request: Request):
 # ═══════════════════════════════════════════════════════════════
 
 @app.post("/api/scan/start")
-async def start_scan(background_tasks: BackgroundTasks, market: str = "ALL"):
+async def start_scan(background_tasks: BackgroundTasks, market: str = "ALL", universe: str = "sp500+nasdaq100"):
     if scan_status["is_running"]:
         return JSONResponse({"status": "already_running", "message": "스캔이 이미 진행 중입니다."})
 
     def _run():
-        run_scan(market=market, triggered_by="manual")
+        run_scan(market=market, universe=universe, triggered_by="manual")
 
     background_tasks.add_task(_run)
     return {"status": "started", "market": market, "message": f"{market} 스캔을 시작했습니다."}
@@ -106,6 +106,30 @@ async def delete_result(result_id: int, db: Session = Depends(get_db)):
     db.delete(r)
     db.commit()
     return {"status": "deleted"}
+
+
+@app.delete("/api/results")
+async def delete_results_bulk(
+    market: str = "ALL",
+    signal_type: str = "ALL",
+    days: int = 0,
+    db: Session = Depends(get_db),
+):
+    """현재 필터 조건에 맞는 스캔 결과 일괄 삭제.
+    days=0 이면 날짜 필터 없이 전체 삭제.
+    """
+    q = db.query(ScanResult)
+    if market != "ALL":
+        q = q.filter(ScanResult.market == market)
+    if signal_type != "ALL":
+        q = q.filter(ScanResult.signal_type == signal_type)
+    if days > 0:
+        since_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+        q = q.filter(ScanResult.signal_date >= since_str)
+    count = q.count()
+    q.delete(synchronize_session=False)
+    db.commit()
+    return {"status": "deleted", "count": count}
 
 
 @app.get("/api/scan/logs")

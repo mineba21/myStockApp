@@ -19,6 +19,21 @@ KR_INDICES = [
     {"ticker": "069500", "name": "KOSPI200"},  # KODEX 200
 ]
 
+# ── 섹터 ETF (Forest-to-Trees 보조) ─────────────────────────────
+US_SECTOR_ETFS = [
+    {"ticker": "XLK", "name": "기술"},
+    {"ticker": "XLF", "name": "금융"},
+    {"ticker": "XLV", "name": "헬스케어"},
+    {"ticker": "XLE", "name": "에너지"},
+    {"ticker": "XLI", "name": "산업재"},
+    {"ticker": "XLY", "name": "경기소비재"},
+]
+KR_SECTOR_ETFS = [
+    {"ticker": "091160", "name": "반도체"},    # KODEX 반도체
+    {"ticker": "305720", "name": "2차전지"},   # KODEX 2차전지산업
+    {"ticker": "244580", "name": "바이오"},    # KODEX 바이오
+]
+
 
 def get_market_stages(force: bool = False) -> Dict:
     """미국·한국 주요 지수의 Weinstein Stage를 반환합니다."""
@@ -32,12 +47,22 @@ def get_market_stages(force: bool = False) -> Dict:
     from scanner.weinstein import stage_of, _slope
     from config import MA_PERIOD
 
-    result: Dict = {"US": [], "KR": [], "updated_at": datetime.now().isoformat()}
+    result: Dict = {
+        "US": [], "KR": [],
+        "US_SECTORS": [], "KR_SECTORS": [],
+        "updated_at": datetime.now().isoformat(),
+    }
 
     for idx in US_INDICES:
         _analyze_index(idx, "US", get_us_ohlcv, MA_PERIOD, stage_of, _slope, result["US"])
     for idx in KR_INDICES:
         _analyze_index(idx, "KR", get_kr_ohlcv, MA_PERIOD, stage_of, _slope, result["KR"])
+
+    # 섹터 ETF 분석 (실패해도 무시)
+    for idx in US_SECTOR_ETFS:
+        _analyze_index(idx, "US", get_us_ohlcv, MA_PERIOD, stage_of, _slope, result["US_SECTORS"])
+    for idx in KR_SECTOR_ETFS:
+        _analyze_index(idx, "KR", get_kr_ohlcv, MA_PERIOD, stage_of, _slope, result["KR_SECTORS"])
 
     result["US_condition"] = _condition(result["US"])
     result["KR_condition"] = _condition(result["KR"])
