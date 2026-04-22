@@ -97,3 +97,23 @@ For Stan Weinstein / Stage Analysis work:
   - test results
   - schema or behavior changes
   - remaining risks / limitations
+
+
+
+## Planning rules
+
+For significant features, refactors, schema changes, or backtest/research work:
+
+- Start in planning mode before editing code.
+- Do not begin implementation until a written plan is produced and approved.
+- Save the plan under `stock-scanner/docs/plans/<task-name>.md`.
+- The plan must include:
+  - current-state summary
+  - goals and non-goals
+  - files to change
+  - design decisions
+  - DB/schema impact
+  - test plan
+  - verification commands
+  - risks / rollback notes
+- If implementation reveals a major change in approach, update the plan first.
