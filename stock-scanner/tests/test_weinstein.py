@@ -7,6 +7,8 @@ Weinstein Scanner — 단위 테스트
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import asyncio
+import json
 import numpy as np
 import pandas as pd
 import pytest
@@ -49,6 +51,28 @@ def _make_stage2_base(n_total=260, base_price=100.0):
         prices.append(base_price + 2 * np.sin(i * np.pi / 5))
         volumes.append(500_000)
     return prices, volumes
+
+
+def _make_strict_v2_breakout_data(final_price=106.0, final_volume=8_000_000):
+    """주봉 Stage2 + 5주 tight base + 마지막 일봉/주봉 돌파 데이터."""
+    prices, volumes = [], []
+    for i in range(300):
+        prices.append(50.0 + 45.0 * i / 299)
+        volumes.append(500_000)
+    for i in range(124):
+        prices.append(100.0 + 1.0 * np.sin(i * np.pi / 5))
+        volumes.append(500_000)
+    prices.append(final_price)
+    volumes.append(final_volume)
+    return _make_df(prices, volumes)
+
+
+def _make_benchmark(n, outperform=True):
+    if outperform:
+        prices = [90.0 + i * 0.02 for i in range(n)]
+    else:
+        prices = [80.0 + i * 0.45 for i in range(n)]
+    return pd.Series(prices, index=_make_df([100.0] * n).index)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -635,6 +659,203 @@ class TestNewFeatures:
         grade_order = {"S": 2, "A": 1, "B": 0}
         assert grade_order[g_bear] <= grade_order[g_bull], \
             "BEAR 장세 등급이 BULL 보다 낮거나 같아야 함"
+
+
+class TestWeinsteinV2:
+
+    def test_weekly_ohlcv_resample(self):
+        """to_weekly_ohlcv: 주봉 OHLCV 집계가 정확해야 함."""
+        from scanner.weinstein import to_weekly_ohlcv
+
+        idx = pd.date_range("2024-01-01", periods=5, freq="D")
+        df = pd.DataFrame({
+            "Open":   [10, 11, 12, 13, 14],
+            "High":   [11, 13, 12, 16, 15],
+            "Low":    [9, 10, 8, 12, 13],
+            "Close":  [10, 12, 11, 15, 14],
+            "Volume": [100, 200, 300, 400, 500],
+        }, index=idx)
+
+        weekly = to_weekly_ohlcv(df)
+        assert len(weekly) == 1
+        row = weekly.iloc[0]
+        assert row["Open"] == 10
+        assert row["High"] == 16
+        assert row["Low"] == 8
+        assert row["Close"] == 14
+        assert row["Volume"] == 1500
+
+    def test_weekly_indicators_and_stage_classification(self):
+        """주봉 지표와 classify_stage가 Stage2/3/4를 구분해야 함."""
+        from scanner.weinstein import compute_weekly_indicators, classify_stage
+
+        weekly_df = pd.DataFrame({
+            "Open":   np.linspace(50, 110, 40),
+            "High":   np.linspace(51, 111, 40),
+            "Low":    np.linspace(49, 109, 40),
+            "Close":  np.linspace(50, 110, 40),
+            "Volume": [1_000_000] * 40,
+        }, index=pd.date_range("2023-01-06", periods=40, freq="W-FRI"))
+        ind = compute_weekly_indicators(weekly_df)
+        assert ind is not None
+        assert ind["cur_sma30w"] > 0
+        assert ind["slope30w"] > 0
+        assert classify_stage(ind, None) == "STAGE2"
+
+        assert classify_stage(
+            {"cur_close_w": 110, "cur_sma30w": 100, "cur_sma10w": 108, "slope30w": 0.0},
+            None,
+        ) == "STAGE3"
+        assert classify_stage(
+            {"cur_close_w": 90, "cur_sma30w": 100, "cur_sma10w": 92, "slope30w": -0.10},
+            None,
+        ) == "STAGE4"
+
+    def test_weekly_base_pivot_excludes_current_bar(self):
+        """detect_base_pivot: 현재 돌파 후보 봉을 base/pivot에 포함하면 안 됨."""
+        from scanner.weinstein import detect_base_pivot
+
+        weekly_df = pd.DataFrame({
+            "Open":   [90, 92, 95, 99, 100, 99, 101, 100, 99, 111],
+            "High":   [91, 93, 96, 101, 102, 101, 102, 101, 102, 130],
+            "Low":    [89, 91, 94, 97, 98, 97, 98, 97, 98, 110],
+            "Close":  [90, 92, 95, 100, 100, 100, 101, 100, 101, 112],
+            "Volume": [1_000_000] * 10,
+        }, index=pd.date_range("2024-01-05", periods=10, freq="W-FRI"))
+
+        base = detect_base_pivot(weekly_df, lookback_weeks=7, min_weeks=5)
+        assert base is not None
+        assert base["pivot_price"] == 102
+        assert base["base_end_idx"] == len(weekly_df) - 2
+        assert base["signal_idx"] == len(weekly_df) - 1
+        assert base["base_width_pct"] <= 15.0
+
+    def test_mansfield_rs_positive_and_negative(self):
+        """compute_relative_performance: 상대 강약이 Mansfield RS 부호에 반영되어야 함."""
+        from scanner.weinstein import compute_relative_performance
+
+        idx = pd.date_range("2023-01-01", periods=500, freq="D")
+        bench = pd.Series(np.linspace(100, 110, 500), index=idx)
+        strong = pd.Series(np.linspace(100, 160, 500), index=idx)
+        weak = pd.Series(np.linspace(100, 95, 500), index=idx)
+
+        strong_rs, strong_trend = compute_relative_performance(strong, bench)
+        weak_rs, _ = compute_relative_performance(weak, bench)
+        assert strong_rs is not None and strong_rs > 0
+        assert strong_trend in ("RISING", "FLAT")
+        assert weak_rs is not None and weak_rs < 0
+
+    def test_strict_v2_breakout_accepts_stage2_rs_volume_base(self, monkeypatch):
+        """strict v2: Stage2 + Mansfield RS + volume + weekly base 조건이면 BREAKOUT 허용."""
+        from scanner.weinstein import analyze_stock
+        import config as cfg
+
+        monkeypatch.setattr(cfg, "WEINSTEIN_MODE", "strict")
+        monkeypatch.setattr(cfg, "WEINSTEIN_V2_STRICT", True)
+        df = _make_strict_v2_breakout_data()
+        bench = _make_benchmark(len(df), outperform=True)
+
+        res = analyze_stock(df, "V2", "V2 테스트", "US", benchmark_close=bench)
+        assert res is not None
+        assert res["signal_type"] == "BREAKOUT"
+        assert res["weekly_stage"] == "STAGE2"
+        assert res["mansfield_rs"] is not None and res["mansfield_rs"] > 0
+        assert res["volume_ratio"] >= 3.0
+        assert res["weekly_volume_ratio"] >= 2.0
+        assert res["base_weeks"] >= 5
+
+    def test_strict_v2_rejects_negative_mansfield_rs(self, monkeypatch):
+        """strict v2: Mansfield RS가 0 이하이면 시그널을 차단해야 함."""
+        from scanner.weinstein import analyze_stock
+        import config as cfg
+
+        monkeypatch.setattr(cfg, "WEINSTEIN_MODE", "strict")
+        monkeypatch.setattr(cfg, "WEINSTEIN_V2_STRICT", True)
+        df = _make_strict_v2_breakout_data()
+        bench = _make_benchmark(len(df), outperform=False)
+
+        res = analyze_stock(df, "V2", "V2 테스트", "US", benchmark_close=bench)
+        assert res is None
+
+    def test_strict_v2_rejects_weak_breakout_volume(self, monkeypatch):
+        """strict v2: 일봉 거래량 hard filter 미달이면 BREAKOUT을 차단해야 함."""
+        from scanner.weinstein import analyze_stock
+        import config as cfg
+
+        monkeypatch.setattr(cfg, "WEINSTEIN_MODE", "strict")
+        monkeypatch.setattr(cfg, "WEINSTEIN_V2_STRICT", True)
+        df = _make_strict_v2_breakout_data(final_volume=700_000)
+        bench = _make_benchmark(len(df), outperform=True)
+
+        res = analyze_stock(df, "V2", "V2 테스트", "US", benchmark_close=bench)
+        assert res is None
+
+    def test_strict_v2_does_not_use_post_signal_weekly_volume(self, monkeypatch):
+        """strict v2: signal_date 이후 주봉 거래량으로 과거 BREAKOUT을 승인하면 안 됨."""
+        from scanner.weinstein import analyze_stock
+        import config as cfg
+
+        monkeypatch.setattr(cfg, "WEINSTEIN_MODE", "strict")
+        monkeypatch.setattr(cfg, "WEINSTEIN_V2_STRICT", True)
+        df = _make_strict_v2_breakout_data(final_volume=2_000_000)
+        last_date = df.index[-1]
+        extra = pd.DataFrame({
+            "Open":   [106.0, 106.2, 106.4],
+            "High":   [106.8, 106.9, 107.0],
+            "Low":    [105.8, 106.0, 106.2],
+            "Close":  [106.4, 106.6, 106.8],
+            "Volume": [20_000_000, 20_000_000, 20_000_000],
+        }, index=pd.DatetimeIndex([last_date + timedelta(days=i) for i in range(1, 4)]))
+        df = pd.concat([df, extra])
+        bench = _make_benchmark(len(df), outperform=True)
+
+        res = analyze_stock(df, "V2", "V2 테스트", "US", benchmark_close=bench)
+        assert res is None
+
+    def test_save_and_api_output_keep_legacy_and_v2_rs_separate(self):
+        """_save와 /api/results가 legacy RS와 Mansfield RS를 분리해 보존해야 함."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from database.models import Base, ScanResult
+        from scanner.scan_engine import _save
+        from web.app import get_results
+
+        engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+        Base.metadata.create_all(bind=engine)
+        Session = sessionmaker(bind=engine)
+        db = Session()
+        today = date.today().strftime("%Y-%m-%d")
+        try:
+            signal = {
+                "market": "US", "ticker": "V2", "name": "V2 테스트",
+                "signal_type": "BREAKOUT", "stage": "STAGE2",
+                "weekly_stage": "STAGE2",
+                "price": 105.0, "ma150": 90.0,
+                "volume": 8_000_000, "volume_avg": 1_000_000,
+                "volume_ratio": 8.0, "signal_date": today,
+                "pivot_price": 102.0, "support_level": 95.0,
+                "signal_quality": "STRONG", "base_quality": "STRONG",
+                "rs": 1.4, "rs_value": 1.4,
+                "mansfield_rs": 5.5, "rs_trend": "RISING",
+                "sma30w": 92.0, "sma10w": 101.0,
+                "weekly_volume_ratio": 2.4,
+                "base_weeks": 6.0, "base_width_pct": 7.5,
+                "warning_flags": ["테스트 경고"],
+            }
+            _save(db, signal)
+            row = db.query(ScanResult).filter(ScanResult.ticker == "V2").first()
+            assert row.rs_value == 1.4
+            assert row.mansfield_rs == 5.5
+            assert row.weekly_stage == "STAGE2"
+            assert json.loads(row.warning_flags) == ["테스트 경고"]
+
+            payload = asyncio.run(get_results(days=1, db=db))
+            assert payload[0]["rs_value"] == 1.4
+            assert payload[0]["mansfield_rs"] == 5.5
+            assert payload[0]["weekly_stage"] == "STAGE2"
+            assert payload[0]["warning_flags"] == ["테스트 경고"]
+        finally:
+            db.close()
 
 
 # ── 실행 ──────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 """스캔 엔진 - 전체 스캔 오케스트레이션"""
+import json
 import logging
 from datetime import datetime
 from typing import Optional, Tuple
@@ -249,6 +250,12 @@ def _check_watchlist(db):
 def _save(db, signal: dict):
     from database.models import ScanResult
     try:
+        warning_flags = signal.get("warning_flags") or []
+        if isinstance(warning_flags, str):
+            warning_flags_json = warning_flags
+        else:
+            warning_flags_json = json.dumps(warning_flags, ensure_ascii=False)
+
         existing = db.query(ScanResult).filter(
             ScanResult.ticker      == signal["ticker"],
             ScanResult.signal_date == signal.get("signal_date", ""),
@@ -268,6 +275,15 @@ def _save(db, signal: dict):
             existing.market_condition = signal.get("market_condition")
             existing.signal_quality   = signal.get("signal_quality")
             existing.rs_value         = signal.get("rs")
+            existing.weekly_stage        = signal.get("weekly_stage")
+            existing.sma30w              = signal.get("sma30w")
+            existing.sma10w              = signal.get("sma10w")
+            existing.weekly_volume_ratio = signal.get("weekly_volume_ratio")
+            existing.mansfield_rs        = signal.get("mansfield_rs")
+            existing.rs_trend            = signal.get("rs_trend")
+            existing.base_weeks          = signal.get("base_weeks")
+            existing.base_width_pct      = signal.get("base_width_pct")
+            existing.warning_flags       = warning_flags_json
             existing.grade            = grade
             existing.scan_time        = datetime.utcnow()
         else:
@@ -289,6 +305,15 @@ def _save(db, signal: dict):
                 market_condition = signal.get("market_condition"),
                 signal_quality   = signal.get("signal_quality"),
                 rs_value         = signal.get("rs"),
+                weekly_stage        = signal.get("weekly_stage"),
+                sma30w              = signal.get("sma30w"),
+                sma10w              = signal.get("sma10w"),
+                weekly_volume_ratio = signal.get("weekly_volume_ratio"),
+                mansfield_rs        = signal.get("mansfield_rs"),
+                rs_trend            = signal.get("rs_trend"),
+                base_weeks          = signal.get("base_weeks"),
+                base_width_pct      = signal.get("base_width_pct"),
+                warning_flags       = warning_flags_json,
                 grade            = grade,
             ))
         db.commit()

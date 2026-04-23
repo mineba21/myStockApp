@@ -43,7 +43,20 @@ BLOCK_NEW_BUYS_IN_BEAR = os.getenv("BLOCK_NEW_BUYS_IN_BEAR", "true").lower() == 
 # CAUTION_MODE 옵션: "block_breakout" | "allow_with_flag" | "allow_all"
 CAUTION_MODE           = os.getenv("CAUTION_MODE", "allow_with_flag")
 
-# ── v4 Weinstein (Weekly Stage Analysis) ───────────────────────
+# ── Weinstein v2 (Weekly Stage Analysis) ───────────────────────
+# legacy: 기존 시그널 동작 유지 + v2 메타데이터 계산
+# v2:     v2 메타데이터를 명시적으로 활성화
+# strict: 주봉 Stage2 / Mansfield RS / 거래량 / base 조건 hard filter
+WEINSTEIN_MODE = os.getenv("WEINSTEIN_MODE", "legacy").lower()
+ENABLE_WEINSTEIN_V2 = (
+    os.getenv("ENABLE_WEINSTEIN_V2", "false").lower() == "true"
+    or WEINSTEIN_MODE in ("v2", "strict")
+)
+WEINSTEIN_V2_STRICT = (
+    os.getenv("WEINSTEIN_V2_STRICT", "false").lower() == "true"
+    or WEINSTEIN_MODE == "strict"
+)
+
 # 주봉 기반 Stage 판정 (원전 충실)
 WEEKLY_MA_LONG    = int(os.getenv("WEEKLY_MA_LONG", "30"))   # 주봉 30-SMA (원전 기준)
 WEEKLY_MA_SHORT   = int(os.getenv("WEEKLY_MA_SHORT", "10"))  # 주봉 10-SMA (추세 확인)
@@ -58,6 +71,9 @@ BREAKOUT_DAILY_VOL_RATIO  = float(os.getenv("BREAKOUT_DAILY_VOL_RATIO",  "3.0"))
 RS_LOOKBACK_WEEKS    = int(os.getenv("RS_LOOKBACK_WEEKS",    "52"))  # Mansfield RS 평균 기간
 BASE_MIN_WEEKS       = int(os.getenv("BASE_MIN_WEEKS",       "5"))   # 최소 base 기간 (주)
 PIVOT_LOOKBACK_WEEKS = int(os.getenv("PIVOT_LOOKBACK_WEEKS", "26"))  # pivot 탐색 최대 기간
+BASE_MAX_WIDTH_PCT   = float(os.getenv("BASE_MAX_WIDTH_PCT", "15.0"))
+BASE_TIGHT_WIDTH_PCT = float(os.getenv("BASE_TIGHT_WIDTH_PCT", "8.0"))
+MANSFIELD_MIN_RS     = float(os.getenv("MANSFIELD_MIN_RS", "0.0"))
 
 # ── Schedule / Infra ────────────────────────────────────────────
 SCHEDULE_TIMES = os.getenv("SCHEDULE_TIMES", "09:00,14:00,22:00").split(",")

@@ -1,6 +1,6 @@
 # Weinstein Scanner — 기술 문서
 
-> 버전: 2.0 | 마지막 업데이트: 2026-04
+> 버전: 2.1 | 마지막 업데이트: 2026-04
 
 ---
 
@@ -25,6 +25,10 @@ scan_engine.run_scan()
         │       ├─► get_kr_ohlcv() / get_us_batch()
         │       │
         │       ├─► analyze_stock()      ← Weinstein 시그널 분석
+        │       │       to_weekly_ohlcv()
+        │       │       compute_weekly_indicators()
+        │       │       compute_relative_performance()
+        │       │       detect_base_pivot()
         │       │       _build_indicators()
         │       │       _find_breakout_signal()
         │       │       _find_rebreakout_signal()
@@ -37,6 +41,37 @@ scan_engine.run_scan()
         │
         └─► _notify()                   ← Telegram 알림
 ```
+
+---
+
+## 1.1 Weinstein v2 모드
+
+기본값은 `WEINSTEIN_MODE=legacy`다. 이 모드에서는 기존 일봉 기반 시그널 동작을
+baseline으로 유지하면서 주봉 Stage, Mansfield RS, 주봉 거래량, base 메타데이터를
+결과 payload에 함께 싣는다.
+
+`WEINSTEIN_MODE=strict` 또는 `WEINSTEIN_V2_STRICT=true`에서는 신규 매수 시그널에
+아래 hard filter를 적용한다.
+
+| 필터 | strict 조건 |
+|------|-------------|
+| Weekly Stage | 주봉 30-SMA 기준 `STAGE2` |
+| Mansfield RS | `mansfield_rs > MANSFIELD_MIN_RS` (기본 0) |
+| Daily Volume | BREAKOUT은 `BREAKOUT_DAILY_VOL_RATIO` 이상 |
+| Weekly Volume | `BREAKOUT_WEEKLY_VOL_RATIO` 이상 |
+| Weekly Base/Pivot | 현재 주봉을 제외한 5~26주 base 폭이 `BASE_MAX_WIDTH_PCT` 이하 |
+
+저장 의미는 명시적으로 분리한다.
+
+| 필드 | 의미 |
+|------|------|
+| `rs` / `rs_value` | legacy 13주 ratio RS |
+| `mansfield_rs` | v2 Mansfield RS |
+| `weekly_stage` | 주봉 30-SMA 기준 Stage |
+| `sma30w`, `sma10w` | 30주/10주 SMA |
+| `weekly_volume_ratio` | 최근 주봉 거래량 / 10주 평균 거래량 |
+| `base_weeks`, `base_width_pct` | 현재 봉을 제외한 주봉 base 기간과 폭 |
+| `warning_flags` | legacy/v2 경고 목록(JSON 문자열로 DB 저장) |
 
 ---
 
@@ -60,6 +95,16 @@ scan_engine.run_scan()
 | `close[signal_day] > pivot_high` | 시그널일에 pivot 돌파 |
 | `volume_ratio >= BREAKOUT_VOLUME_RATIO` | 거래량 확장 (기본 1.5x) |
 | `extension < BREAKOUT_MAX_EXTENDED_PCT` | MA150 대비 과매수 아님 (기본 15%) |
+
+**strict v2 추가 조건**
+
+| 조건 | 설명 |
+|------|------|
+| `weekly_stage == STAGE2` | 주봉 30-SMA 위 + 30-SMA 상승 |
+| `mansfield_rs > 0` | 시장 대비 상대강도 양수 |
+| `daily_volume_ratio >= BREAKOUT_DAILY_VOL_RATIO` | 기본 3.0배 |
+| `weekly_volume_ratio >= BREAKOUT_WEEKLY_VOL_RATIO` | 기본 2.0배 |
+| `weekly_base_width <= BASE_MAX_WIDTH_PCT` | 현재 주봉 제외 base 폭 기본 15% 이하 |
 
 **이유**: 단순 MA 교차만으로는 가짜 신호가 많음. Base + Pivot + Volume 삼중 조건으로
 기관 매수가 수반된 실질적 돌파만 포착.
@@ -195,6 +240,23 @@ NEUTRAL 🔵 — 모든 지수가 STAGE1 또는 STAGE2
 | `SCAN_LOOKBACK_DAYS` | 7 | 최근 N일 이내 시그널 탐색 |
 | `VOLUME_AVG_PERIOD` | 20 | 평균 거래량 기산 기간 |
 
+### Weinstein v2
+
+| 변수 | 기본값 | 설명 |
+|------|--------|------|
+| `WEINSTEIN_MODE` | legacy | `legacy` / `v2` / `strict` |
+| `ENABLE_WEINSTEIN_V2` | false | v2 메타데이터 명시 활성화 |
+| `WEINSTEIN_V2_STRICT` | false | strict hard filter 활성화 |
+| `WEEKLY_MA_LONG` | 30 | 주봉 장기 SMA |
+| `WEEKLY_MA_SHORT` | 10 | 주봉 단기 SMA |
+| `BREAKOUT_WEEKLY_VOL_RATIO` | 2.0 | strict 주봉 거래량 배율 |
+| `BREAKOUT_DAILY_VOL_RATIO` | 3.0 | strict BREAKOUT 일봉 거래량 배율 |
+| `RS_LOOKBACK_WEEKS` | 52 | Mansfield RS 평균 기간 |
+| `BASE_MIN_WEEKS` | 5 | 주봉 base 최소 기간 |
+| `PIVOT_LOOKBACK_WEEKS` | 26 | 주봉 pivot 탐색 기간 |
+| `BASE_MAX_WIDTH_PCT` | 15.0 | 주봉 base 최대 폭 |
+| `MANSFIELD_MIN_RS` | 0.0 | strict Mansfield RS 하한 |
+
 ### BREAKOUT
 
 | 변수 | 기본값 | 설명 |
@@ -240,9 +302,15 @@ NEUTRAL 🔵 — 모든 지수가 STAGE1 또는 STAGE2
 
 | 함수 | 역할 |
 |------|------|
+| `to_weekly_ohlcv()` | 일봉 OHLCV를 금요일 기준 주봉으로 변환 |
+| `compute_weekly_indicators()` | 30주/10주 SMA, 30주 SMA 기울기, 주봉 거래량비 계산 |
+| `classify_stage()` | 주봉 30-SMA 기준 Stage 분류 |
+| `compute_relative_performance()` | Mansfield RS와 RS 추세 계산 |
+| `detect_base_pivot()` | 현재 봉을 제외한 주봉 base/pivot 탐지 |
+| `detect_stage2_breakout_v2()` | strict v2 BREAKOUT hard filter |
 | `_slope()` | MA 기울기(% / bar) 계산 |
 | `stage_of()` | Weinstein Stage 분류 (STAGE1~4) |
-| `calc_rs()` | 상대강도 계산 (주식 수익률 / 지수 수익률) |
+| `calc_rs()` | legacy ratio RS 계산 (주식 수익률 / 지수 수익률) |
 | `_build_indicators()` | MA150, MA50, vol_avg 등 지표 dict 반환 |
 | `_find_breakout_signal()` | BREAKOUT 탐지 (pivot/base 기반) |
 | `_find_rebreakout_signal()` | RE_BREAKOUT 탐지 (continuation base) |

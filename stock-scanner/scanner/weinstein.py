@@ -1,6 +1,6 @@
-"""Weinstein Stage Analysis Engine  (v4 — Weekly 30-SMA 원전 충실)
+"""Weinstein Stage Analysis Engine  (v2 — Weekly 30-SMA 원전 충실)
 
-v4 업데이트:
+v2 업데이트:
   • 주봉 30-SMA + 10-SMA 기반 Stage 판정 (원전 기준)
   • Mansfield RS: (ratio / SMA52(ratio) - 1) * 100  (0선이 기준선)
   • Base Pivot: 5~26주 tight(≤15% 폭) 횡보 → pivot 돌파
@@ -36,13 +36,14 @@ from config import (
     REBOUND_MAX_PULLBACK_PCT, REBOUND_REQUIRE_VOLUME_DRYUP,
 )
 
-# v4 신규 파라미터 (backward compat: 없으면 기본값)
+# v2 신규 파라미터 (backward compat: 없으면 기본값)
 try:
     from config import (
         WEEKLY_MA_LONG, WEEKLY_MA_SHORT,
         DAILY_MA_FAST, DAILY_MA_SLOW,
         BREAKOUT_WEEKLY_VOL_RATIO, BREAKOUT_DAILY_VOL_RATIO,
         RS_LOOKBACK_WEEKS, BASE_MIN_WEEKS, PIVOT_LOOKBACK_WEEKS,
+        BASE_MAX_WIDTH_PCT, BASE_TIGHT_WIDTH_PCT, MANSFIELD_MIN_RS,
     )
 except ImportError:
     WEEKLY_MA_LONG            = 30
@@ -54,6 +55,9 @@ except ImportError:
     RS_LOOKBACK_WEEKS         = 52
     BASE_MIN_WEEKS            = 5
     PIVOT_LOOKBACK_WEEKS      = 26
+    BASE_MAX_WIDTH_PCT        = 15.0
+    BASE_TIGHT_WIDTH_PCT      = 8.0
+    MANSFIELD_MIN_RS          = 0.0
 
 
 RS_PERIOD = 65  # 13주(65거래일) 상대강도 — legacy ratio RS용
@@ -64,8 +68,22 @@ _FLAT_SLOPE   = 0.02
 
 
 # ══════════════════════════════════════════════════════════════════
-# v4 — 주봉 / Mansfield RS / Base Pivot (신규 공개 API)
+# v2 — 주봉 / Mansfield RS / Base Pivot (신규 공개 API)
 # ══════════════════════════════════════════════════════════════════
+
+def _weinstein_mode_flags() -> Tuple[str, bool, bool]:
+    """현재 Weinstein v2 모드 플래그를 동적으로 읽는다.
+
+    테스트에서 config 값을 monkeypatch 해도 재import 없이 반영하기 위함이다.
+    """
+    try:
+        import config as cfg
+        mode = getattr(cfg, "WEINSTEIN_MODE", "legacy").lower()
+        enabled = bool(getattr(cfg, "ENABLE_WEINSTEIN_V2", False)) or mode in ("v2", "strict")
+        strict = bool(getattr(cfg, "WEINSTEIN_V2_STRICT", False)) or mode == "strict"
+        return mode, enabled, strict
+    except Exception:
+        return "legacy", False, False
 
 def to_weekly_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """일봉 OHLCV → 주봉 OHLCV (금요일 기준).
@@ -192,22 +210,23 @@ def compute_relative_performance(close: pd.Series,
     if close is None or benchmark_close is None:
         return None, None
     try:
+        stock_weekly = _to_weekly_close(close)
+        bench_weekly = _to_weekly_close(benchmark_close)
+
         # 인덱스 정렬: 공통 날짜만
         aligned = pd.DataFrame({
-            "s": close.astype(float),
-            "b": benchmark_close.astype(float),
+            "s": stock_weekly.astype(float),
+            "b": bench_weekly.astype(float),
         }).dropna()
-        if len(aligned) < lookback_weeks * 5:   # 일봉 기준 최소 52주 ≈ 260일
+        if len(aligned) < lookback_weeks:
             return None, None
 
-        # 일봉에서 주 단위 lookback (× 5)
         ratio = aligned["s"] / aligned["b"].replace(0, np.nan)
         ratio = ratio.dropna()
-        if len(ratio) < lookback_weeks * 5:
+        if len(ratio) < lookback_weeks:
             return None, None
 
-        win = lookback_weeks * 5
-        sma = ratio.rolling(win, min_periods=win // 2).mean()
+        sma = ratio.rolling(lookback_weeks, min_periods=lookback_weeks).mean()
         cur_ratio = float(ratio.iloc[-1])
         cur_sma   = float(sma.iloc[-1]) if not pd.isna(sma.iloc[-1]) else None
         if cur_sma is None or cur_sma == 0:
@@ -215,8 +234,8 @@ def compute_relative_performance(close: pd.Series,
 
         rs_value = (cur_ratio / cur_sma - 1.0) * 100.0
 
-        # trend: 최근 25거래일(≈5주) 기울기
-        recent = ratio.iloc[-25:]
+        # trend: 최근 5주 기울기
+        recent = ratio.iloc[-5:]
         if len(recent) >= 5:
             x = np.arange(len(recent))
             k = np.polyfit(x, recent.values, 1)[0]
@@ -232,6 +251,38 @@ def compute_relative_performance(close: pd.Series,
         return None, None
 
 
+def _to_weekly_close(series: pd.Series) -> pd.Series:
+    """가격 series를 Friday close 기준 주봉 close로 변환."""
+    if series is None:
+        return pd.Series(dtype=float)
+    s = series.dropna().astype(float).copy()
+    if len(s) == 0:
+        return s
+    idx = pd.to_datetime(s.index, errors="coerce")
+    if pd.isna(idx).any():
+        return s.reset_index(drop=True)
+    s.index = idx
+    if len(idx) >= 2:
+        median_days = pd.Series(idx).diff().dropna().dt.days.median()
+        if median_days is not None and median_days <= 3:
+            return s.resample("W-FRI").last().dropna()
+    return s.sort_index()
+
+
+def _slice_to_signal_date_df(df: pd.DataFrame, signal_date: str) -> pd.DataFrame:
+    signal_day = pd.to_datetime(signal_date).date()
+    idx = pd.to_datetime(df.index)
+    return df.loc[idx.date <= signal_day].copy()
+
+
+def _slice_to_signal_date_series(series: Optional[pd.Series], signal_date: str) -> Optional[pd.Series]:
+    if series is None:
+        return None
+    signal_day = pd.to_datetime(signal_date).date()
+    idx = pd.to_datetime(series.index)
+    return series.loc[idx.date <= signal_day].copy()
+
+
 def detect_base_pivot(df: pd.DataFrame,
                       lookback_weeks: int = PIVOT_LOOKBACK_WEEKS,
                       min_weeks: int = BASE_MIN_WEEKS) -> Optional[Dict[str, Any]]:
@@ -239,31 +290,46 @@ def detect_base_pivot(df: pd.DataFrame,
 
     조건:
       - 최소 min_weeks 이상 연속 횡보
-      - 폭(high_max - low_min)/pivot ≤ 15% (WIDE 는 거부)
+      - 폭(high_max - low_min)/pivot ≤ BASE_MAX_WIDTH_PCT
+      - 현재 bar 는 돌파 후보로 보고 base 계산에서 제외
       - 가장 최근 base 1개만 반환
+
+    df 는 주봉 OHLCV 를 우선으로 받는다. 일봉이 들어오면 호환을 위해
+    5거래일≈1주로 환산하되, v2 strict 경로에서는 주봉 df 만 전달한다.
 
     반환:
       { pivot_price, base_low, base_start_idx, base_end_idx, base_weeks,
         base_width_pct, base_quality: "TIGHT" | "LOOSE" | "WIDE" }
     """
-    if df is None or len(df) < min_weeks * 5 + 5:
+    if df is None or len(df) < 3:
         return None
 
-    close = df["Close"]
     high  = df["High"]
     low   = df["Low"]
     n     = len(df)
 
-    lookback_days = lookback_weeks * 5
-    start = max(0, n - lookback_days - 2)
-    end   = n - 1  # 현재 bar 는 돌파 후보 (base 에서 제외)
+    idx = pd.to_datetime(df.index)
+    if len(idx) >= 2:
+        median_days = pd.Series(idx).diff().dropna().dt.days.median()
+        rows_per_week = 5 if median_days is not None and median_days <= 3 else 1
+    else:
+        rows_per_week = 1
+
+    min_rows = max(1, int(min_weeks * rows_per_week))
+    lookback_rows = max(min_rows, int(lookback_weeks * rows_per_week))
+    if n < min_rows + 1:
+        return None
+
+    signal_idx = n - 1
+    base_end_idx = signal_idx - 1
+    start = max(0, base_end_idx - lookback_rows + 1)
 
     best = None
-    # 뒤에서 앞으로 확장하면서 폭 ≤ 15% 를 유지하는 최장 base 찾기
-    pivot_price = float(high.iloc[end - 1])
-    base_low    = float(low.iloc[end - 1])
+    # 뒤에서 앞으로 확장하면서 허용 폭을 유지하는 가장 긴 최신 base를 찾는다.
+    pivot_price = float(high.iloc[base_end_idx])
+    base_low    = float(low.iloc[base_end_idx])
 
-    for j in range(end - 1, start - 1, -1):
+    for j in range(base_end_idx, start - 1, -1):
         h = float(high.iloc[j])
         l = float(low.iloc[j])
         pivot_price = max(pivot_price, h)
@@ -271,22 +337,23 @@ def detect_base_pivot(df: pd.DataFrame,
         if pivot_price <= 0:
             continue
         width_pct = (pivot_price - base_low) / pivot_price * 100
-        base_days = end - j
-        base_weeks = base_days / 5.0
+        base_rows = base_end_idx - j + 1
+        base_weeks = base_rows / rows_per_week
 
         # 폭이 너무 크면 중단
-        if width_pct > 15.0:
+        if width_pct > BASE_MAX_WIDTH_PCT:
             break
 
-        if base_weeks >= min_weeks:
-            if width_pct <= 8.0:   quality = "TIGHT"
-            elif width_pct <= 15.0: quality = "LOOSE"
+        if base_rows >= min_rows:
+            if width_pct <= BASE_TIGHT_WIDTH_PCT:   quality = "TIGHT"
+            elif width_pct <= BASE_MAX_WIDTH_PCT: quality = "LOOSE"
             else:                   quality = "WIDE"
             best = {
                 "pivot_price":     round(pivot_price, 4),
                 "base_low":        round(base_low, 4),
                 "base_start_idx":  j,
-                "base_end_idx":    end,
+                "base_end_idx":    base_end_idx,
+                "signal_idx":      signal_idx,
                 "base_weeks":      round(base_weeks, 1),
                 "base_width_pct":  round(width_pct, 2),
                 "base_quality":    quality,
@@ -302,10 +369,30 @@ def _daily_vol_ratio(df: pd.DataFrame, idx: int) -> float:
     return v / a if a > 0 else 0.0
 
 
+def _weekly_base_metadata(weekly_ind: Optional[Dict]) -> Optional[Dict[str, Any]]:
+    if not weekly_ind:
+        return None
+    return detect_base_pivot(
+        weekly_ind.get("weekly_df"),
+        lookback_weeks=PIVOT_LOOKBACK_WEEKS,
+        min_weeks=BASE_MIN_WEEKS,
+    )
+
+
+def _attach_base_metadata(sig: Dict[str, Any], base: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not base:
+        return sig
+    sig["weekly_pivot_price"] = base.get("pivot_price")
+    sig["base_weeks"] = base.get("base_weeks")
+    sig["base_width_pct"] = base.get("base_width_pct")
+    sig["weekly_base_quality"] = base.get("base_quality")
+    return sig
+
+
 def detect_stage2_breakout(df: pd.DataFrame,
                            weekly_ind: Optional[Dict],
                            daily_ind: Optional[Dict]) -> Optional[Dict[str, Any]]:
-    """Stage1→Stage2 base pivot 상향 돌파 감지 (v4).
+    """Stage1→Stage2 base pivot 상향 돌파 감지 (legacy-compatible v2 metadata).
 
     조건:
       - Stage == STAGE1 or STAGE2 (30w SMA 위 또는 근접)
@@ -327,6 +414,9 @@ def detect_stage2_breakout(df: pd.DataFrame,
     if sig is None:
         return None
 
+    weekly_base = _weekly_base_metadata(weekly_ind)
+    sig = _attach_base_metadata(sig, weekly_base)
+
     warning_flags: List[str] = []
     if weekly_ind is not None:
         wvr = weekly_ind.get("weekly_volume_ratio", 0.0)
@@ -334,9 +424,57 @@ def detect_stage2_breakout(df: pd.DataFrame,
             warning_flags.append(f"약한 주봉 거래량 ({wvr:.1f}x)")
         if stage == "STAGE1":
             warning_flags.append("STAGE1 → 2 전환 (조기 진입)")
+        if weekly_base is None:
+            warning_flags.append("주봉 base 미확인")
 
     sig["warning_flags"] = warning_flags
-    sig["stage_v4"]      = stage
+    sig["stage_v2"]      = stage
+    return sig
+
+
+def detect_stage2_breakout_v2(df: pd.DataFrame,
+                              weekly_ind: Optional[Dict],
+                              daily_ind: Optional[Dict]) -> Optional[Dict[str, Any]]:
+    """Strict Weinstein v2 breakout.
+
+    주봉 Stage2, 주봉 base/pivot, 일봉 돌파, 일봉/주봉 거래량을 모두 hard filter로 적용한다.
+    """
+    if daily_ind is None or weekly_ind is None:
+        return None
+
+    if classify_stage(weekly_ind, daily_ind) != "STAGE2":
+        return None
+
+    weekly_df = weekly_ind.get("weekly_df")
+    weekly_base = _weekly_base_metadata(weekly_ind)
+    if weekly_df is None or weekly_base is None:
+        return None
+
+    pivot = weekly_base.get("pivot_price")
+    if pivot is None or len(weekly_df) < 2:
+        return None
+
+    prev_week_close = float(weekly_df["Close"].iloc[-2])
+    cur_week_close = float(weekly_df["Close"].iloc[-1])
+    if prev_week_close > pivot or cur_week_close <= pivot:
+        return None
+
+    sig = _find_breakout_signal(daily_ind)
+    if sig is None:
+        return None
+    signal_close = float(_slice_to_signal_date_df(df, sig["signal_date"])["Close"].iloc[-1])
+    if signal_close <= pivot:
+        return None
+
+    if sig.get("vol_ratio", 0.0) < BREAKOUT_DAILY_VOL_RATIO:
+        return None
+    if weekly_ind.get("weekly_volume_ratio", 0.0) < BREAKOUT_WEEKLY_VOL_RATIO:
+        return None
+
+    sig = _attach_base_metadata(sig, weekly_base)
+    sig["pivot_price"] = weekly_base["pivot_price"]
+    sig["warning_flags"] = []
+    sig["stage_v2"] = "STAGE2"
     return sig
 
 
@@ -357,7 +495,7 @@ def detect_continuation_breakout(df: pd.DataFrame,
     if weekly_ind and weekly_ind.get("weekly_volume_ratio", 0) < 1.5:
         warning_flags.append("주봉 거래량 감소")
     sig["warning_flags"] = warning_flags
-    sig["stage_v4"]      = stage
+    sig["stage_v2"]      = stage
     return sig
 
 
@@ -383,7 +521,7 @@ def detect_rebound_entry(df: pd.DataFrame,
         if weekly_ind.get("slope30w", 0) <= _FLAT_SLOPE:
             warning_flags.append("주봉 30-SMA 기울기 둔화")
     sig["warning_flags"] = warning_flags
-    sig["stage_v4"]      = stage
+    sig["stage_v2"]      = stage
     return sig
 
 
@@ -732,6 +870,89 @@ def _signal_quality(vol_ratio: float, slope: float, rs: Optional[float],
     return "WEAK"
 
 
+def _passes_v2_strict_filters(sig: Dict[str, Any],
+                              weekly_stage: str,
+                              weekly_ind: Optional[Dict],
+                              mansfield_rs: Optional[float]) -> Tuple[bool, List[str]]:
+    """Strict v2 hard filters for buy signals."""
+    reasons: List[str] = []
+
+    if weekly_stage != "STAGE2":
+        reasons.append(f"weekly_stage={weekly_stage}")
+
+    if mansfield_rs is None or mansfield_rs <= MANSFIELD_MIN_RS:
+        reasons.append("Mansfield RS <= 0")
+
+    sig_type = sig.get("signal_type")
+    daily_min = {
+        "BREAKOUT": BREAKOUT_DAILY_VOL_RATIO,
+        "RE_BREAKOUT": REBREAKOUT_VOLUME_RATIO,
+        "REBOUND": 1.3,
+    }.get(sig_type, BREAKOUT_VOLUME_RATIO)
+    if sig.get("vol_ratio", 0.0) < daily_min:
+        reasons.append(f"daily volume < {daily_min:.1f}x")
+
+    weekly_vol = weekly_ind.get("weekly_volume_ratio") if weekly_ind else None
+    if weekly_vol is None or weekly_vol < BREAKOUT_WEEKLY_VOL_RATIO:
+        reasons.append(f"weekly volume < {BREAKOUT_WEEKLY_VOL_RATIO:.1f}x")
+
+    if sig_type == "BREAKOUT":
+        if sig.get("base_weeks") is None or sig.get("base_width_pct") is None:
+            reasons.append("weekly base missing")
+
+    return not reasons, reasons
+
+
+def _strict_signal_context(df: pd.DataFrame,
+                           sig: Dict[str, Any],
+                           benchmark_close: Optional[pd.Series]) -> Optional[Dict[str, Any]]:
+    """signal_date 시점까지만 사용해 strict v2 context를 재계산한다."""
+    signal_date = sig.get("signal_date")
+    if not signal_date:
+        return None
+
+    df_at_signal = _slice_to_signal_date_df(df, signal_date)
+    if df_at_signal is None or len(df_at_signal) == 0:
+        return None
+
+    daily_ind = _build_indicators(df_at_signal)
+    if daily_ind is None:
+        return None
+
+    weekly_df = to_weekly_ohlcv(df_at_signal)
+    weekly_ind = compute_weekly_indicators(weekly_df) if len(weekly_df) > 0 else None
+    weekly_stage = classify_stage(weekly_ind, daily_ind)
+
+    bench_at_signal = _slice_to_signal_date_series(benchmark_close, signal_date)
+    mansfield_rs, rs_trend = (None, None)
+    rs_legacy = None
+    if bench_at_signal is not None:
+        mansfield_rs, rs_trend = compute_relative_performance(
+            daily_ind["close"], bench_at_signal, lookback_weeks=RS_LOOKBACK_WEEKS
+        )
+        rs_legacy = calc_rs(daily_ind["close"], bench_at_signal)
+
+    if sig.get("signal_type") == "BREAKOUT":
+        strict_sig = detect_stage2_breakout_v2(df_at_signal, weekly_ind, daily_ind)
+        if strict_sig is None or strict_sig.get("signal_date") != signal_date:
+            return None
+        sig = {**sig, **strict_sig}
+
+    passed, _ = _passes_v2_strict_filters(sig, weekly_stage, weekly_ind, mansfield_rs)
+    if not passed:
+        return None
+
+    return {
+        "sig": sig,
+        "daily_ind": daily_ind,
+        "weekly_ind": weekly_ind,
+        "weekly_stage": weekly_stage,
+        "mansfield_rs": mansfield_rs,
+        "rs_trend": rs_trend,
+        "rs_legacy": rs_legacy,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════
 # 공개 API — analyze_stock / check_sell_signal
 # ══════════════════════════════════════════════════════════════════
@@ -739,40 +960,55 @@ def _signal_quality(vol_ratio: float, slope: float, rs: Optional[float],
 def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
                   benchmark_close: pd.Series = None,
                   market_condition: str = None) -> Optional[dict]:
-    """주식 하나에 대해 Weinstein 매수 시그널을 탐지 (v4 강화).
+    """주식 하나에 대해 Weinstein 매수 시그널을 탐지.
 
     반환 dict:
       기존 필드: ticker, name, market, signal_type, stage, price, ma150, ma50,
                 price_vs_ma_pct, ma_slope, volume, volume_avg, volume_ratio,
                 signal_date, rs, pivot_price, support_level, base_quality,
                 market_condition, signal_quality, rs_passed
-      v4 신규: sma30w, sma10w, weekly_stage, rs_value (Mansfield),
+      v2 신규: sma30w, sma10w, weekly_stage, mansfield_rs,
               rs_trend, weekly_volume_ratio, base_weeks, warning_flags
     """
     if df is None or len(df) < MA_PERIOD + BREAKOUT_BASE_LOOKBACK_DAYS + 10:
         return None
 
     df = df.copy().sort_index()
+    _, _, strict_v2 = _weinstein_mode_flags()
 
-    # ── v4: 주봉 + 일봉 indicator 병렬 계산 ──
+    # ── v2: 주봉 + 일봉 indicator 병렬 계산 ──
     daily_ind  = _build_indicators(df)
     if daily_ind is None:
         return None
 
     weekly_df  = to_weekly_ohlcv(df)
     weekly_ind = compute_weekly_indicators(weekly_df) if len(weekly_df) > 0 else None
-    v4_stage   = classify_stage(weekly_ind, daily_ind)
+    weekly_stage = classify_stage(weekly_ind, daily_ind)
 
-    # ── v4: BEAR 장세에서 Stage4 는 1차 차단 (scan_engine 필터와 2중) ──
-    if market_condition == "BEAR" and v4_stage == "STAGE4":
+    # ── v2: BEAR 장세에서 Stage4 는 1차 차단 (scan_engine 필터와 2중) ──
+    if market_condition == "BEAR" and weekly_stage == "STAGE4":
         return None
 
-    # 시그널 탐지 — v4 detector 우선, legacy 로직 그대로 위임
-    sig = (
-        detect_stage2_breakout(df, weekly_ind, daily_ind)
-        or detect_continuation_breakout(df, weekly_ind, daily_ind)
-        or detect_rebound_entry(df, weekly_ind, daily_ind)
-    )
+    strict_context = None
+
+    # 시그널 탐지 — legacy baseline 유지, strict 모드에서는 signal_date 기준으로 재검증
+    if strict_v2:
+        sig = (
+            _find_breakout_signal(daily_ind)
+            or _find_rebreakout_signal(daily_ind)
+            or _find_rebound_signal(daily_ind)
+        )
+        if sig is not None:
+            strict_context = _strict_signal_context(df, sig, benchmark_close)
+            if strict_context is None:
+                return None
+            sig = strict_context["sig"]
+    else:
+        sig = (
+            detect_stage2_breakout(df, weekly_ind, daily_ind)
+            or detect_continuation_breakout(df, weekly_ind, daily_ind)
+            or detect_rebound_entry(df, weekly_ind, daily_ind)
+        )
     if sig is None:
         return None
 
@@ -784,22 +1020,29 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
 
     pct = (cur_p - cur_m150) / cur_m150 * 100 if cur_m150 else 0.0
 
-    # ── Mansfield RS (v4) + legacy ratio RS ──
-    rs_value, rs_trend = (None, None)
+    # ── Mansfield RS (v2) + legacy ratio RS ──
+    mansfield_rs, rs_trend = (None, None)
     rs_legacy = None
     if benchmark_close is not None:
-        rs_value, rs_trend = compute_relative_performance(
+        mansfield_rs, rs_trend = compute_relative_performance(
             daily_ind["close"], benchmark_close, lookback_weeks=RS_LOOKBACK_WEEKS
         )
         rs_legacy = calc_rs(daily_ind["close"], benchmark_close)
+
+    if strict_v2:
+        weekly_ind = strict_context["weekly_ind"]
+        weekly_stage = strict_context["weekly_stage"]
+        mansfield_rs = strict_context["mansfield_rs"]
+        rs_trend = strict_context["rs_trend"]
+        rs_legacy = strict_context["rs_legacy"]
 
     # signal_quality 는 legacy ratio RS 로 계산 (기존 테스트 호환)
     qual = _signal_quality(sig["vol_ratio"], slope, rs_legacy, sig["signal_type"])
 
     # warning_flags 축적
     warning_flags: List[str] = list(sig.get("warning_flags") or [])
-    if rs_value is not None and rs_value < 0:
-        warning_flags.append(f"Mansfield RS < 0 ({rs_value:+.1f})")
+    if mansfield_rs is not None and mansfield_rs < 0:
+        warning_flags.append(f"Mansfield RS < 0 ({mansfield_rs:+.1f})")
     if rs_trend == "FALLING":
         warning_flags.append("RS 하락 추세")
 
@@ -809,7 +1052,7 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
         "market":          market,
         "signal_type":     sig["signal_type"],
         "stage":           daily_ind["stage"],       # legacy — 일봉 기준
-        "weekly_stage":    v4_stage,                 # v4 — 주봉 기준
+        "weekly_stage":    weekly_stage,             # v2 — 주봉 기준
         "price":           round(cur_p, 4),
         "ma150":           round(cur_m150, 4),
         "ma50":            round(daily_ind["cur_m50"], 4),
@@ -820,14 +1063,19 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
         "volume_ratio":    sig["vol_ratio"],
         "signal_date":     sig["signal_date"],
         "rs":              rs_legacy,                # legacy ratio RS
-        "rs_value":        rs_value,                 # Mansfield RS
+        "rs_value":        rs_legacy,                # DB/API legacy alias
+        "mansfield_rs":    mansfield_rs,             # v2 Mansfield RS
         "rs_trend":        rs_trend,
         "pivot_price":     sig.get("pivot_price"),
         "support_level":   sig.get("support_level"),
         "base_quality":    sig.get("base_quality", "N/A"),
+        "base_weeks":      sig.get("base_weeks"),
+        "base_width_pct":  sig.get("base_width_pct"),
+        "weekly_base_quality": sig.get("weekly_base_quality"),
         "market_condition": market_condition,
         "signal_quality":  qual,
         "rs_passed":       (rs_legacy is not None and rs_legacy >= 1.0),
+        "mansfield_rs_passed": (mansfield_rs is not None and mansfield_rs > MANSFIELD_MIN_RS),
         "warning_flags":   warning_flags,
     }
     if weekly_ind is not None:

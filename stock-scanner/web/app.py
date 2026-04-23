@@ -3,6 +3,7 @@ FastAPI 웹 애플리케이션
 """
 
 import logging
+import json
 import threading
 from datetime import datetime, timedelta
 from typing import Optional, List
@@ -83,6 +84,17 @@ async def get_scan_status():
 @app.get("/api/results")
 async def get_results(market: str = "ALL", signal_type: str = "ALL",
                       days: int = 7, limit: int = 200, db: Session = Depends(get_db)):
+    def _warning_flags(value):
+        if not value:
+            return []
+        if isinstance(value, list):
+            return value
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+
     since_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
     q = db.query(ScanResult).filter(ScanResult.signal_date >= since_str)
     if market != "ALL":
@@ -94,7 +106,17 @@ async def get_results(market: str = "ALL", signal_type: str = "ALL",
              "market": r.market, "ticker": r.ticker, "name": r.name,
              "signal_type": r.signal_type, "stage": r.stage,
              "price": r.price, "ma150": r.ma150,
-             "volume_ratio": r.volume_ratio, "signal_date": r.signal_date}
+             "volume_ratio": r.volume_ratio, "signal_date": r.signal_date,
+             "rs": r.rs_value, "rs_value": r.rs_value,
+             "pivot_price": r.pivot_price, "support_level": r.support_level,
+             "market_condition": r.market_condition,
+             "signal_quality": r.signal_quality, "grade": r.grade,
+             "weekly_stage": r.weekly_stage,
+             "sma30w": r.sma30w, "sma10w": r.sma10w,
+             "weekly_volume_ratio": r.weekly_volume_ratio,
+             "mansfield_rs": r.mansfield_rs, "rs_trend": r.rs_trend,
+             "base_weeks": r.base_weeks, "base_width_pct": r.base_width_pct,
+             "warning_flags": _warning_flags(r.warning_flags)}
             for r in rows]
 
 

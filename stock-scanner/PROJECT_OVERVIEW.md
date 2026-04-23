@@ -115,12 +115,19 @@ stock-scanner/
     "volume_ratio",   # 거래량 배율
     "signal_date",    # 시그널 발생일 "YYYY-MM-DD"
     "rs",             # 상대강도 (None 가능)
+    "rs_value",       # legacy ratio RS 저장/API alias
+    "mansfield_rs",   # Weinstein v2 Mansfield RS
+    "weekly_stage",   # 주봉 30-SMA 기준 Stage
+    "weekly_volume_ratio",
     "pivot_price",    # BREAKOUT/RE_BREAKOUT 기준가
     "support_level",  # MA50 지지선
+    "base_weeks",
+    "base_width_pct",
     "base_quality",   # "STRONG" | "WEAK" | "N/A"  ← v3 추가
     "signal_quality", # "STRONG" | "MODERATE" | "WEAK"
     "market_condition",  # "BULL" | "BEAR" | "CAUTION" | "NEUTRAL"
     "rs_passed",      # RS >= 1.0 여부
+    "warning_flags",  # v2 경고 목록
 }
 ```
 
@@ -284,8 +291,15 @@ SQLAlchemy `_migrate()`로 구버전 DB에 새 컬럼 자동 추가.
 | support_level | FLOAT | MA50 지지선 |
 | market_condition | VARCHAR(20) | BULL/BEAR/CAUTION/NEUTRAL |
 | signal_quality | VARCHAR(10) | STRONG/MODERATE/WEAK |
-| rs_value | FLOAT | 상대강도 값 |
+| rs_value | FLOAT | legacy ratio RS 값 |
 | grade | VARCHAR(5) | S / A / B 종합 등급 |
+| weekly_stage | VARCHAR(10) | 주봉 30-SMA 기준 Stage |
+| sma30w / sma10w | FLOAT | 30주 / 10주 SMA |
+| weekly_volume_ratio | FLOAT | 주봉 거래량 배율 |
+| mansfield_rs | FLOAT | Weinstein v2 Mansfield RS |
+| rs_trend | VARCHAR(10) | RISING / FALLING / FLAT |
+| base_weeks / base_width_pct | FLOAT | 주봉 base 기간 / 폭 |
+| warning_flags | TEXT | JSON list 형태 경고 목록 |
 
 ### `scan_logs` — 스캔 실행 기록
 

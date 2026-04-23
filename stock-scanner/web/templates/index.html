@@ -297,6 +297,17 @@
                 :title="'상대강도: 시장 대비 '+r.rs+'배 수익률 (13주)'"
                 x-text="'RS '+r.rs+'x'"></span>
             </template>
+            <template x-if="r.weekly_stage">
+              <span class="text-xs px-2 py-0.5 rounded-full font-semibold"
+                :class="r.weekly_stage==='STAGE2'?'bg-emerald-100 text-emerald-700':r.weekly_stage==='STAGE4'?'bg-red-100 text-red-700':'bg-slate-100 text-slate-600'"
+                x-text="'주봉 '+r.weekly_stage"></span>
+            </template>
+            <template x-if="r.mansfield_rs!=null">
+              <span class="text-xs px-2 py-0.5 rounded-full font-semibold"
+                :class="r.mansfield_rs>0?'bg-indigo-100 text-indigo-700':'bg-slate-100 text-slate-500'"
+                :title="'Mansfield RS: '+r.mansfield_rs"
+                x-text="r.mansfield_rs>0 ? 'MRS +'+r.mansfield_rs.toFixed(1) : 'MRS '+r.mansfield_rs.toFixed(1)"></span>
+            </template>
           </div>
           <span class="text-xs text-slate-400 flex-shrink-0">
             <span class="text-slate-300">시그널</span> <span x-text="r.signal_date||r.scan_time?.slice(0,10)"></span>
@@ -319,6 +330,14 @@
               x-text="(r.volume_ratio||0).toFixed(1)+'x'"></div>
           </div>
         </div>
+        <template x-if="r.warning_flags && r.warning_flags.length">
+          <div class="mb-3 flex flex-wrap gap-1">
+            <template x-for="flag in r.warning_flags" :key="flag">
+              <span class="text-[11px] px-2 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-100"
+                x-text="flag"></span>
+            </template>
+          </div>
+        </template>
         <div class="flex gap-2">
           <button @click="openAddTxFromScan(r)"
             class="flex-1 text-xs bg-white/80 hover:bg-white border border-slate-200 rounded-lg py-1.5 text-slate-600 hover:text-indigo-600 transition font-medium">

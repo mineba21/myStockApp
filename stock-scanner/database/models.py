@@ -37,8 +37,18 @@ class ScanResult(Base):
     support_level    = Column(Float,       nullable=True)   # MA50 지지선
     market_condition = Column(String(20),  nullable=True)   # BULL/BEAR/CAUTION/NEUTRAL
     signal_quality   = Column(String(10),  nullable=True)   # STRONG/MODERATE/WEAK
-    rs_value         = Column(Float,       nullable=True)   # 상대강도 값
+    rs_value         = Column(Float,       nullable=True)   # legacy ratio RS 값
     grade            = Column(String(5),   nullable=True)   # S/A/B 종합 등급
+    # ── Weinstein v2 주봉/RS 메타데이터 (nullable) ─────────────
+    weekly_stage        = Column(String(10), nullable=True)  # 주봉 30-SMA 기준 Stage
+    sma30w              = Column(Float,      nullable=True)  # 30주 SMA
+    sma10w              = Column(Float,      nullable=True)  # 10주 SMA
+    weekly_volume_ratio = Column(Float,      nullable=True)  # 주봉 거래량 배율
+    mansfield_rs        = Column(Float,      nullable=True)  # Mansfield RS
+    rs_trend            = Column(String(10), nullable=True)  # RISING/FALLING/FLAT
+    base_weeks          = Column(Float,      nullable=True)  # 주봉 base 기간
+    base_width_pct      = Column(Float,      nullable=True)  # 주봉 base 폭
+    warning_flags       = Column(Text,       nullable=True)  # JSON list[str]
 
 
 class ScanLog(Base):
@@ -210,6 +220,15 @@ def _migrate():
             ("signal_quality",   "ALTER TABLE scan_results ADD COLUMN signal_quality VARCHAR(10)"),
             ("rs_value",         "ALTER TABLE scan_results ADD COLUMN rs_value REAL"),
             ("grade",            "ALTER TABLE scan_results ADD COLUMN grade VARCHAR(5)"),
+            ("weekly_stage",        "ALTER TABLE scan_results ADD COLUMN weekly_stage VARCHAR(10)"),
+            ("sma30w",              "ALTER TABLE scan_results ADD COLUMN sma30w REAL"),
+            ("sma10w",              "ALTER TABLE scan_results ADD COLUMN sma10w REAL"),
+            ("weekly_volume_ratio", "ALTER TABLE scan_results ADD COLUMN weekly_volume_ratio REAL"),
+            ("mansfield_rs",        "ALTER TABLE scan_results ADD COLUMN mansfield_rs REAL"),
+            ("rs_trend",            "ALTER TABLE scan_results ADD COLUMN rs_trend VARCHAR(10)"),
+            ("base_weeks",          "ALTER TABLE scan_results ADD COLUMN base_weeks REAL"),
+            ("base_width_pct",      "ALTER TABLE scan_results ADD COLUMN base_width_pct REAL"),
+            ("warning_flags",       "ALTER TABLE scan_results ADD COLUMN warning_flags TEXT"),
         ]:
             if col not in sr_cols:
                 try:
