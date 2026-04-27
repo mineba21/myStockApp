@@ -20,8 +20,6 @@ _signal_quality(), _find_*() 는 legacy wrapper 로 그대로 동작.
 import numpy as np
 import pandas as pd
 from typing import Optional, Dict, Any, List, Tuple
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (
     MA_PERIOD, MA_SLOPE_PERIOD, VOLUME_AVG_PERIOD, SCAN_LOOKBACK_DAYS,
@@ -837,9 +835,52 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
     return result
 
 
+def _weekly_breakdown(weekly_df: Optional[pd.DataFrame]) -> bool:
+    """현재 주봉 종가가 30주 SMA 아래로 이탈했는지 (true weekly path)."""
+    if weekly_df is None or len(weekly_df) < WEEKLY_MA_LONG:
+        return False
+    ind = compute_weekly_indicators(weekly_df)
+    if ind is None:
+        return False
+    return ind["cur_close_w"] < ind["cur_sma30w"]
+
+
+def _weekly_slope_reversal(weekly_df: Optional[pd.DataFrame]) -> bool:
+    """주봉 30-SMA 기울기가 양→음으로 반전했는지 (현재 ≤ 0, 5주 전 > 0)."""
+    if weekly_df is None or len(weekly_df) < WEEKLY_MA_LONG + 5:
+        return False
+    sma30 = (weekly_df["Close"]
+             .rolling(WEEKLY_MA_LONG, min_periods=WEEKLY_MA_LONG // 2)
+             .mean()
+             .dropna())
+    if len(sma30) < MA_SLOPE_PERIOD + 5:
+        return False
+    cur_slope  = _slope(sma30,           n=MA_SLOPE_PERIOD)
+    past_slope = _slope(sma30.iloc[:-5], n=MA_SLOPE_PERIOD)
+    return past_slope > 0 and cur_slope <= 0
+
+
+def _rs_deteriorating(close: pd.Series,
+                      benchmark_close: Optional[pd.Series]) -> bool:
+    """Mansfield RS < 0 AND 추세 == FALLING."""
+    if benchmark_close is None:
+        return False
+    rs_value, rs_trend = compute_relative_performance(close, benchmark_close)
+    if rs_value is None:
+        return False
+    return rs_value < 0 and rs_trend == "FALLING"
+
+
 def check_sell_signal(df: pd.DataFrame, ticker: str, name: str, market: str,
-                      buy_price: float = None, stop_loss: float = None) -> Optional[dict]:
-    """감시 종목 매도 시그널 체크 (severity: HIGH / MEDIUM / LOW)."""
+                      buy_price: float = None, stop_loss: float = None,
+                      weekly_df: Optional[pd.DataFrame] = None,
+                      benchmark_close: Optional[pd.Series] = None) -> Optional[dict]:
+    """감시 종목 매도 시그널 체크 (severity: HIGH / MEDIUM / LOW).
+
+    옵션 인자 weekly_df / benchmark_close 가 제공되면 30주 SMA 붕괴/슬로프
+    반전/Mansfield RS 악화 분기를 추가로 평가한다. 인자가 None 이면 기존 결과를
+    그대로 유지하므로 Phase 1 단독 머지 시 호출부 회귀가 없다.
+    """
     if df is None or len(df) < MA_PERIOD + 20:
         return None
 
@@ -859,6 +900,10 @@ def check_sell_signal(df: pd.DataFrame, ticker: str, name: str, market: str,
         reason   = f"손절가 도달 (현재 {cur_p:,.0f} ≤ 손절 {stop_loss:,.0f})"
         severity = "HIGH"
 
+    elif _weekly_breakdown(weekly_df):
+        reason   = "주봉 30-SMA 하향 이탈"
+        severity = "HIGH"
+
     elif stage == "STAGE4":
         for i in range(1, 4):
             pp = float(close.iloc[-i - 1])
@@ -873,6 +918,14 @@ def check_sell_signal(df: pd.DataFrame, ticker: str, name: str, market: str,
         if slope_past > 0 and slope <= 0:
             reason   = "MA150 기울기 반전 (상승 추세 약화)"
             severity = "MEDIUM"
+
+    if reason is None and _weekly_slope_reversal(weekly_df):
+        reason   = "주봉 30-SMA 기울기 반전"
+        severity = "MEDIUM"
+
+    if reason is None and _rs_deteriorating(close, benchmark_close):
+        reason   = "상대강도(Mansfield RS) 악화"
+        severity = "MEDIUM"
 
     if reason is None and stage == "STAGE3":
         reason   = "Stage3 진입 징후 (고점 부근, 분배 주의)"

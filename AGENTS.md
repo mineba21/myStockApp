@@ -12,8 +12,9 @@
 
 Before making non-trivial changes, read:
 
-1. `stock-scanner/PROJECT_OVERVIEW.md`
-2. `stock-scanner/docs/weinstein_scanner.md`
+1. `docs/strategy/weinstein.md` — strategy invariants ("왜").
+2. `docs/refactor/weinstein-refactor-plan.md` — phase status and history ("어떻게/언제").
+3. `CLAUDE.md` — durable implementation rules.
 
 For Weinstein scanner tasks, inspect at minimum:
 

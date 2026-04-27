@@ -6,6 +6,8 @@
 <title>Weinstein Stage Scanner</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+<!-- Phase 4: 차트 라이브러리 (Lightweight-Charts v4 standalone CDN, ~52KB gzip) -->
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   [x-cloak]{display:none!important}
   .tab-active{border-bottom:3px solid #6366f1;color:#4f46e5;font-weight:700}
@@ -320,13 +322,17 @@
           </div>
         </div>
         <div class="flex gap-2">
+          <button @click="openChart(r)"
+            class="flex-1 text-xs bg-white/80 hover:bg-white border border-slate-200 rounded-lg py-1.5 text-slate-600 hover:text-emerald-600 transition font-medium">
+            📈 차트
+          </button>
           <button @click="openAddTxFromScan(r)"
             class="flex-1 text-xs bg-white/80 hover:bg-white border border-slate-200 rounded-lg py-1.5 text-slate-600 hover:text-indigo-600 transition font-medium">
-            + 매수 기록
+            + 매수
           </button>
           <button @click="openAddWatch(r)"
             class="flex-1 text-xs bg-white/80 hover:bg-white border border-slate-200 rounded-lg py-1.5 text-slate-600 hover:text-amber-600 transition font-medium">
-            👁 감시 등록
+            👁 감시
           </button>
         </div>
       </div>
@@ -1155,6 +1161,69 @@
   </div>
 </div>
 
+<!-- ══════════════════ 모달: 차트 ════════════════════════ -->
+<div x-show="chartModal.open" x-cloak class="modal-bg" @click.self="closeChart()" @keydown.escape.window="closeChart()">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-4xl p-4 sm:p-6">
+    <div class="flex justify-between items-start mb-4 gap-3 flex-wrap">
+      <div class="flex items-center gap-2 flex-wrap">
+        <span class="text-xs px-2 py-0.5 rounded-full font-semibold"
+          :class="chartModal.market==='KR'?'bg-red-100 text-red-700':'bg-blue-100 text-blue-700'"
+          x-text="chartModal.market==='KR'?'🇰🇷 KR':'🇺🇸 US'"></span>
+        <h2 class="text-base font-bold text-slate-800" x-text="chartModal.name || chartModal.ticker"></h2>
+        <span class="text-xs text-slate-400" x-text="chartModal.ticker"></span>
+      </div>
+      <button @click="closeChart()" class="text-slate-400 text-2xl leading-none">×</button>
+    </div>
+
+    <div class="flex flex-wrap items-center gap-2 mb-3">
+      <div class="inline-flex rounded-lg bg-slate-100 p-0.5">
+        <button @click="setChartTimeframe('daily')"
+          :class="chartModal.timeframe==='daily'?'bg-white shadow text-indigo-600':'text-slate-500'"
+          class="text-xs font-semibold px-3 py-1 rounded-md transition">일봉</button>
+        <button @click="setChartTimeframe('weekly')"
+          :class="chartModal.timeframe==='weekly'?'bg-white shadow text-indigo-600':'text-slate-500'"
+          class="text-xs font-semibold px-3 py-1 rounded-md transition">주봉</button>
+      </div>
+      <select @change="setChartRange($event.target.value)" :value="chartModal.range"
+        class="input !w-auto !py-1 text-xs">
+        <option value="6m">6개월</option>
+        <option value="1y">1년</option>
+        <option value="2y">2년</option>
+        <option value="5y">5년</option>
+      </select>
+      <span class="text-xs text-slate-400 ml-auto"
+        x-text="chartModal.timeframe==='weekly'?'30주 MA':'150일 MA'"></span>
+    </div>
+
+    <div class="relative" style="height:420px">
+      <div id="chart-container" class="w-full h-full rounded-lg border border-slate-100"></div>
+
+      <!-- 로딩 -->
+      <div x-show="chartModal.loading"
+        class="absolute inset-0 flex items-center justify-center bg-white/70 rounded-lg">
+        <div class="flex items-center gap-2 text-slate-500 text-sm">
+          <div class="w-5 h-5 border-2 border-indigo-200 border-t-indigo-500 rounded-full spin"></div>
+          <span>차트를 불러오는 중...</span>
+        </div>
+      </div>
+
+      <!-- 빈 데이터 -->
+      <div x-show="!chartModal.loading && chartModal.empty && !chartModal.error"
+        class="absolute inset-0 flex items-center justify-center text-slate-400 text-sm">
+        📭 데이터 없음
+      </div>
+
+      <!-- 에러 -->
+      <div x-show="!chartModal.loading && chartModal.error"
+        class="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm">
+        <div class="text-red-500">⚠️ 차트를 불러오지 못했습니다</div>
+        <div class="text-xs text-slate-400" x-text="chartModal.error"></div>
+        <button @click="loadChart()" class="btn btn-ghost text-xs mt-1">다시 시도</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ══════════════════ 토스트 ════════════════════════════ -->
 <div class="fixed bottom-5 right-5 z-50 flex flex-col gap-2" style="pointer-events:none">
   <template x-for="t in toasts" :key="t.id">
@@ -1227,6 +1296,13 @@ function app() {
     // 감시
     watchList: [], showWatchModal: false,
     watchForm: {market:'KR'},
+
+    // 차트 (Phase 4)
+    chartModal: {open:false, market:'', ticker:'', name:'',
+                 timeframe:'daily', range:'1y',
+                 loading:false, error:null, empty:false},
+    _chart: null, _chartCandles: null, _chartVolume: null, _chartMa: null,
+    _chartResizeObs: null,
 
     toasts: [],
     _si: null, _ci: null,
@@ -1556,6 +1632,154 @@ function app() {
       const id=Date.now();
       this.toasts.push({id,message,type});
       setTimeout(()=>{ this.toasts=this.toasts.filter(t=>t.id!==id); }, 4000);
+    },
+
+    // ── 차트 (Phase 4) ──
+    openChart(r) {
+      this.chartModal.market = r.market;
+      this.chartModal.ticker = r.ticker;
+      this.chartModal.name = r.name || r.ticker;
+      this.chartModal.timeframe = 'daily';
+      this.chartModal.range = '1y';
+      this.chartModal.error = null;
+      this.chartModal.empty = false;
+      this.chartModal.open = true;
+      this.$nextTick(() => this.loadChart());
+    },
+
+    closeChart() {
+      this.chartModal.open = false;
+      this._destroyChart();
+    },
+
+    setChartTimeframe(tf) {
+      if (this.chartModal.timeframe === tf) return;
+      this.chartModal.timeframe = tf;
+      this.loadChart();
+    },
+
+    setChartRange(range) {
+      if (this.chartModal.range === range) return;
+      this.chartModal.range = range;
+      this.loadChart();
+    },
+
+    _destroyChart() {
+      if (this._chartResizeObs) {
+        try { this._chartResizeObs.disconnect(); } catch{}
+        this._chartResizeObs = null;
+      }
+      if (this._chart) {
+        try { this._chart.remove(); } catch{}
+        this._chart = null;
+      }
+      this._chartCandles = null;
+      this._chartVolume = null;
+      this._chartMa = null;
+    },
+
+    async loadChart() {
+      if (typeof LightweightCharts === 'undefined') {
+        this.chartModal.error = '차트 라이브러리 로딩 실패';
+        return;
+      }
+      this.chartModal.loading = true;
+      this.chartModal.error = null;
+      this.chartModal.empty = false;
+      const {market, ticker, timeframe, range} = this.chartModal;
+      try {
+        const url = `/api/chart/ohlcv?market=${encodeURIComponent(market)}`
+                  + `&ticker=${encodeURIComponent(ticker)}`
+                  + `&timeframe=${timeframe}&range=${range}`;
+        const resp = await fetch(url);
+        if (!resp.ok) {
+          let msg = `HTTP ${resp.status}`;
+          try { const j = await resp.json(); if (j.detail) msg = j.detail; } catch{}
+          throw new Error(msg);
+        }
+        const body = await resp.json();
+        const candles = body.candles || [];
+        if (candles.length === 0) {
+          this.chartModal.empty = true;
+          this._destroyChart();
+          return;
+        }
+        this._renderChart(candles, body.ma_period);
+      } catch (e) {
+        this.chartModal.error = (e && e.message) ? e.message : String(e);
+        this._destroyChart();
+      } finally {
+        this.chartModal.loading = false;
+      }
+    },
+
+    _renderChart(candles, maPeriod) {
+      const el = document.getElementById('chart-container');
+      if (!el) return;
+
+      this._destroyChart();
+
+      const chart = LightweightCharts.createChart(el, {
+        width: el.clientWidth,
+        height: el.clientHeight,
+        layout: {background: {color:'#ffffff'}, textColor:'#475569', fontSize:11},
+        grid: {vertLines:{color:'#f1f5f9'}, horzLines:{color:'#f1f5f9'}},
+        rightPriceScale: {borderColor:'#e2e8f0', scaleMargins:{top:0.05, bottom:0.25}},
+        timeScale: {borderColor:'#e2e8f0', timeVisible:false, secondsVisible:false},
+        crosshair: {mode: 1},
+      });
+
+      const candleSeries = chart.addCandlestickSeries({
+        upColor:'#16a34a', downColor:'#dc2626',
+        borderUpColor:'#16a34a', borderDownColor:'#dc2626',
+        wickUpColor:'#16a34a', wickDownColor:'#dc2626',
+      });
+      candleSeries.setData(candles.map(c => ({
+        time: c.t, open: c.o, high: c.h, low: c.l, close: c.c,
+      })));
+
+      const maData = candles
+        .filter(c => c.ma != null)
+        .map(c => ({time: c.t, value: c.ma}));
+      let maSeries = null;
+      if (maData.length > 0) {
+        maSeries = chart.addLineSeries({
+          color:'#6366f1', lineWidth:2, priceLineVisible:false,
+          lastValueVisible:true,
+          title: maPeriod ? `MA${maPeriod}` : 'MA',
+        });
+        maSeries.setData(maData);
+      }
+
+      const volumeSeries = chart.addHistogramSeries({
+        priceFormat:{type:'volume'},
+        priceScaleId:'volume',
+        color:'#94a3b8',
+      });
+      chart.priceScale('volume').applyOptions({
+        scaleMargins: {top: 0.78, bottom: 0},
+      });
+      volumeSeries.setData(candles.map(c => ({
+        time: c.t,
+        value: c.v,
+        color: c.c >= c.o ? 'rgba(22,163,74,0.45)' : 'rgba(220,38,38,0.45)',
+      })));
+
+      chart.timeScale().fitContent();
+
+      this._chart = chart;
+      this._chartCandles = candleSeries;
+      this._chartVolume = volumeSeries;
+      this._chartMa = maSeries;
+
+      if (typeof ResizeObserver !== 'undefined') {
+        this._chartResizeObs = new ResizeObserver(() => {
+          if (this._chart && el) {
+            this._chart.applyOptions({width: el.clientWidth, height: el.clientHeight});
+          }
+        });
+        this._chartResizeObs.observe(el);
+      }
     },
   };
 }

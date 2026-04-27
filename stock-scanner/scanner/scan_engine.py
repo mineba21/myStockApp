@@ -137,7 +137,7 @@ def run_scan(market: str = "ALL", universe: str = None,
             sigs, cnt = _scan_us(db, us_universe, us_bench, us_condition)
             buy_signals.extend(sigs); total_scanned += cnt
 
-        sell_signals = _check_watchlist(db)
+        sell_signals = _check_watchlist(db, kr_bench=kr_bench, us_bench=us_bench)
 
         if buy_signals or sell_signals:
             _notify(buy_signals, sell_signals, send_telegram_message)
@@ -224,9 +224,15 @@ def _scan_us(db, universe, benchmark_close=None, market_condition=None):
     return signals, count
 
 
-def _check_watchlist(db):
+def _check_watchlist(db, kr_bench=None, us_bench=None):
+    """감시목록 매도 시그널 체크.
+
+    Phase 2: 일봉(df) → 주봉(weekly_df)을 derive 해서 check_sell_signal에 전달.
+    벤치마크가 주어지면 Mansfield RS 악화 분기까지 평가. 일봉/주봉/벤치마크
+    가운데 어느 하나라도 미확보면 해당 분기는 None 폴백으로 graceful 처리.
+    """
     from database.models import WatchList
-    from scanner.weinstein import check_sell_signal
+    from scanner.weinstein import check_sell_signal, to_weekly_ohlcv
     from scanner.kr_stocks import get_kr_ohlcv
     from scanner.us_stocks import get_us_ohlcv
 
@@ -237,8 +243,13 @@ def _check_watchlist(db):
             df = get_kr_ohlcv(w.ticker) if w.market == "KR" else get_us_ohlcv(w.ticker)
             if df is None:
                 continue
+            weekly_df = to_weekly_ohlcv(df)
+            if weekly_df is None or len(weekly_df) == 0:
+                weekly_df = None
+            bench = kr_bench if w.market == "KR" else us_bench
             sig = check_sell_signal(df, w.ticker, w.name, w.market,
-                                    buy_price=w.buy_price, stop_loss=w.stop_loss)
+                                    buy_price=w.buy_price, stop_loss=w.stop_loss,
+                                    weekly_df=weekly_df, benchmark_close=bench)
             if sig:
                 sells.append(sig)
         except Exception as e:

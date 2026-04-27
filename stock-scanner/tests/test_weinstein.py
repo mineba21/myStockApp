@@ -637,6 +637,308 @@ class TestNewFeatures:
             "BEAR 장세 등급이 BULL 보다 낮거나 같아야 함"
 
 
+# ═══════════════════════════════════════════════════════════════════
+# 8. 주봉 지표 (compute_weekly_indicators) 단위 테스트 — Phase 1
+# ═══════════════════════════════════════════════════════════════════
+
+class TestWeeklyIndicators:
+
+    def test_weekly_indicators_basic_rising(self):
+        """250일 약한 상승 → 30w SMA 양수 슬로프, close > sma30w."""
+        from scanner.weinstein import to_weekly_ohlcv, compute_weekly_indicators
+
+        prices = [50.0 + i * 0.2 for i in range(250)]   # 50→99.8
+        df     = _make_df(prices)
+        weekly = to_weekly_ohlcv(df)
+        ind    = compute_weekly_indicators(weekly)
+
+        assert ind is not None, "주봉 30주 이상 데이터인데 None 반환"
+        assert ind["cur_sma30w"] > 0
+        assert ind["slope30w"] > 0,                 f"상승 추세 슬로프 양수여야 함, got {ind['slope30w']}"
+        assert ind["cur_close_w"] > ind["cur_sma30w"]
+        assert "weekly_volume_ratio" in ind
+
+    def test_weekly_indicators_short_data_returns_none(self):
+        """주봉 30주 미만 데이터는 None."""
+        from scanner.weinstein import to_weekly_ohlcv, compute_weekly_indicators
+
+        # 100일 ≈ 20주 → 30주 미달
+        df     = _make_df([100.0] * 100)
+        weekly = to_weekly_ohlcv(df)
+        assert compute_weekly_indicators(weekly) is None
+
+    def test_weekly_indicators_falling_slope(self):
+        """하락 추세에서 30w SMA 슬로프 음수, close < sma30w."""
+        from scanner.weinstein import to_weekly_ohlcv, compute_weekly_indicators
+
+        prices = [200.0 - i * 0.4 for i in range(250)]   # 200→100
+        df     = _make_df(prices)
+        weekly = to_weekly_ohlcv(df)
+        ind    = compute_weekly_indicators(weekly)
+
+        assert ind is not None
+        assert ind["slope30w"] < 0,                 f"하락 추세 슬로프 음수여야 함, got {ind['slope30w']}"
+        assert ind["cur_close_w"] < ind["cur_sma30w"]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 9. Mansfield RS (compute_relative_performance) 단위 테스트
+# ═══════════════════════════════════════════════════════════════════
+
+class TestMansfieldRS:
+
+    @staticmethod
+    def _series(prices):
+        idx = pd.date_range(start="2020-01-01", periods=len(prices), freq="B")
+        return pd.Series([float(p) for p in prices], index=idx)
+
+    def test_rs_outperform_positive(self):
+        """주식이 벤치마크보다 강할 때 Mansfield RS > 0."""
+        from scanner.weinstein import compute_relative_performance
+
+        n     = 300
+        # 처음 절반은 동일하게 → ratio SMA 자리잡고, 후반에 outperform
+        stock = [100.0] * 150 + [100.0 + i * 0.5 for i in range(150)]
+        bench = [100.0] * 150 + [100.0 + i * 0.1 for i in range(150)]
+        rs_value, rs_trend = compute_relative_performance(
+            self._series(stock), self._series(bench)
+        )
+        assert rs_value is not None
+        assert rs_value > 0, f"outperform 시 RS > 0 이어야 함, got {rs_value}"
+        assert rs_trend in ("RISING", "FALLING", "FLAT")
+
+    def test_rs_underperform_negative(self):
+        """주식이 벤치마크보다 약할 때 Mansfield RS < 0."""
+        from scanner.weinstein import compute_relative_performance
+
+        n     = 300
+        stock = [100.0] * 150 + [100.0 + i * 0.05 for i in range(150)]
+        bench = [100.0] * 150 + [100.0 + i * 0.5  for i in range(150)]
+        rs_value, _ = compute_relative_performance(
+            self._series(stock), self._series(bench)
+        )
+        assert rs_value is not None
+        assert rs_value < 0, f"underperform 시 RS < 0 이어야 함, got {rs_value}"
+
+    def test_rs_short_data_returns_none(self):
+        """260일(=52주) 미만이면 None 반환."""
+        from scanner.weinstein import compute_relative_performance
+
+        n     = 100
+        stock = self._series([100.0] * n)
+        bench = self._series([100.0] * n)
+        rs_value, rs_trend = compute_relative_performance(stock, bench)
+        assert rs_value is None
+        assert rs_trend is None
+
+    def test_rs_falling_trend_detected(self):
+        """최근 5주 ratio 하락 → trend == FALLING."""
+        from scanner.weinstein import compute_relative_performance
+
+        # 250일 outperform 후 50일 stock 빠른 하락 + bench 상승 → ratio 급락
+        stock = [100.0 + i * 0.5 for i in range(250)]
+        last_s = stock[-1]
+        stock += [last_s - i * 1.0 for i in range(50)]
+        bench  = [100.0 + i * 0.2 for i in range(250)]
+        last_b = bench[-1]
+        bench += [last_b + i * 0.3 for i in range(50)]
+
+        _, rs_trend = compute_relative_performance(
+            self._series(stock), self._series(bench)
+        )
+        assert rs_trend == "FALLING", f"기대 FALLING, got {rs_trend}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 10. Base Pivot (detect_base_pivot) 단위 테스트
+# ═══════════════════════════════════════════════════════════════════
+
+class TestBasePivot:
+
+    def test_tight_base_detected_in_sideways(self):
+        """5주 이상 ±2% 횡보 → base 탐지, 폭 ≤ 8%."""
+        from scanner.weinstein import detect_base_pivot
+
+        # 60일 동안 100 ± 1.5 횡보 → 폭 ≈ 3% (TIGHT)
+        prices = [100.0 + np.sin(i * np.pi / 4) * 1.5 for i in range(60)]
+        df     = _make_df(prices)
+        result = detect_base_pivot(df)
+
+        assert result is not None,                          "5주 이상 tight 횡보면 base 탐지되어야 함"
+        assert result["base_weeks"]    >= 5
+        assert result["base_width_pct"] <= 8.0
+        assert result["base_quality"]  == "TIGHT"
+
+    def test_no_base_when_data_too_short(self):
+        """min_weeks*5 + 5 = 30 미만이면 None."""
+        from scanner.weinstein import detect_base_pivot
+
+        df = _make_df([100.0] * 10)   # 10일 < 30
+        assert detect_base_pivot(df) is None
+
+    def test_loose_base_classification(self):
+        """폭 8~15% 횡보면 LOOSE 등급."""
+        from scanner.weinstein import detect_base_pivot
+
+        # 60일 동안 95~107 진동 → 폭 ≈ 11% (LOOSE)
+        prices = [101.0 + np.sin(i * np.pi / 5) * 6.0 for i in range(60)]
+        df     = _make_df(prices)
+        result = detect_base_pivot(df)
+
+        assert result is not None
+        assert 8.0 < result["base_width_pct"] <= 15.0
+        assert result["base_quality"]         == "LOOSE"
+
+    def test_base_returns_pivot_above_low(self):
+        """탐지된 base 의 pivot_price > base_low."""
+        from scanner.weinstein import detect_base_pivot
+
+        prices = [100.0 + np.sin(i * np.pi / 4) * 1.5 for i in range(60)]
+        df     = _make_df(prices)
+        result = detect_base_pivot(df)
+        assert result is not None
+        assert result["pivot_price"] > result["base_low"]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 11. STAGE 분류 경계 조건 (classify_stage)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestStageBoundary:
+
+    def test_stage3_above_ma_flat_slope(self):
+        """close > sma30w + slope ≈ 0 → STAGE3 (분배)."""
+        from scanner.weinstein import classify_stage
+
+        ind = {"cur_close_w": 110.0, "cur_sma30w": 100.0,
+               "cur_sma10w": 109.0,  "slope30w": 0.0}
+        assert classify_stage(ind, None) == "STAGE3"
+
+    def test_stage3_when_short_sma_weakens(self):
+        """close > sma30w + 약한 상승 + sma10 < close*0.98 → STAGE3."""
+        from scanner.weinstein import classify_stage
+
+        # slope=0.04 < _RISING_SLOPE=0.05, sma10 105 < close 110*0.98=107.8
+        ind = {"cur_close_w": 110.0, "cur_sma30w": 100.0,
+               "cur_sma10w": 105.0,  "slope30w": 0.04}
+        assert classify_stage(ind, None) == "STAGE3"
+
+    def test_stage2_when_above_and_rising(self):
+        """close > sma30w + slope > 0.05 → STAGE2."""
+        from scanner.weinstein import classify_stage
+
+        ind = {"cur_close_w": 110.0, "cur_sma30w": 100.0,
+               "cur_sma10w": 109.0,  "slope30w": 0.10}
+        assert classify_stage(ind, None) == "STAGE2"
+
+    def test_stage4_below_and_falling(self):
+        """close < sma30w + slope < -0.02 → STAGE4."""
+        from scanner.weinstein import classify_stage
+
+        ind = {"cur_close_w": 90.0,  "cur_sma30w": 100.0,
+               "cur_sma10w": 92.0,   "slope30w": -0.10}
+        assert classify_stage(ind, None) == "STAGE4"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 12. check_sell_signal — 신규 옵션 분기 (Phase 1)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestSellSignalNewBranches:
+
+    @staticmethod
+    def _safe_daily_df():
+        """기존 분기를 트리거하지 않는 daily df.
+
+        80→106 으로 일정한 약한 상승 → MA150 양수 슬로프 + Stage2,
+        stop_loss/STAGE4/MA150 반전/STAGE3 분기 모두 미발현.
+        """
+        prices = [80.0 + i * 0.1 for i in range(260)]
+        return _make_df(prices)
+
+    @staticmethod
+    def _make_weekly(weekly_prices):
+        n       = len(weekly_prices)
+        idx     = pd.date_range(start="2020-01-03", periods=n, freq="W-FRI")
+        prices  = [float(p) for p in weekly_prices]
+        return pd.DataFrame({
+            "Open":   [p * 0.998 for p in prices],
+            "High":   [p * 1.005 for p in prices],
+            "Low":    [p * 0.995 for p in prices],
+            "Close":  prices,
+            "Volume": [1_000_000] * n,
+        }, index=idx)
+
+    # ── Helper 단위 테스트 ──────────────────────────────────────────
+
+    def test_weekly_breakdown_helper(self):
+        """_weekly_breakdown: 마지막 close < 30w SMA → True."""
+        from scanner.weinstein import _weekly_breakdown
+
+        weekly = self._make_weekly([100.0 + i * 0.5 for i in range(50)] + [105.0])
+        assert _weekly_breakdown(weekly) is True
+
+        weekly_ok = self._make_weekly([100.0 + i * 0.5 for i in range(50)])
+        assert _weekly_breakdown(weekly_ok) is False
+        assert _weekly_breakdown(None)      is False
+
+    def test_weekly_slope_reversal_helper(self):
+        """_weekly_slope_reversal: 강한 상승 후 가파른 하락 → True."""
+        from scanner.weinstein import _weekly_slope_reversal
+
+        # 50주 +1/wk 상승 → 5주 -30/wk 가파른 하락. SMA30 cur_slope<0 & past_slope>0.
+        prices  = [200.0 + i for i in range(50)]
+        prices += [249.0 - 30.0 * (i + 1) for i in range(5)]
+        assert _weekly_slope_reversal(self._make_weekly(prices)) is True
+
+        # 일관 상승은 반전 없음 (WEEKLY_MA_LONG + 5 = 35주 이상 필요)
+        steady = [100.0 + i for i in range(80)]
+        assert _weekly_slope_reversal(self._make_weekly(steady)) is False
+        assert _weekly_slope_reversal(None) is False
+
+    def test_rs_deterioration_helper(self):
+        """_rs_deteriorating: RS<0 + FALLING → True."""
+        from scanner.weinstein import _rs_deteriorating
+
+        idx   = pd.date_range(start="2020-01-01", periods=300, freq="B")
+        # 250일 outperform 후 50일 빠른 하락 + bench 가속 상승
+        stock = [100.0 + i * 0.5 for i in range(250)]
+        stock += [stock[-1] - i * 1.2 for i in range(50)]
+        bench = [100.0 + i * 0.2 for i in range(250)]
+        bench += [bench[-1] + i * 0.4 for i in range(50)]
+        s = pd.Series([float(x) for x in stock], index=idx)
+        b = pd.Series([float(x) for x in bench], index=idx)
+        assert _rs_deteriorating(s, b) is True
+
+        # benchmark None → False
+        assert _rs_deteriorating(s, None) is False
+
+    # ── check_sell_signal 통합 분기 테스트 ─────────────────────────
+
+    def test_weekly_breakdown_triggers_high_sell(self):
+        """주봉 30-SMA 하향 이탈 → severity HIGH."""
+        from scanner.weinstein import check_sell_signal
+
+        daily  = self._safe_daily_df()
+        weekly = self._make_weekly(
+            [100.0 + i * 0.5 for i in range(50)] + [105.0]
+        )
+        res = check_sell_signal(daily, "T", "테스트", "US", weekly_df=weekly)
+        assert res is not None
+        assert res["severity"]    == "HIGH"
+        assert "주봉" in res["sell_reason"]
+
+    def test_no_regression_when_options_omitted(self):
+        """weekly_df / benchmark_close 미제공 시 기존 결과 유지."""
+        from scanner.weinstein import check_sell_signal
+
+        # Stage2 강세 → 기존에도 None 반환 → 신규 분기로도 None 유지
+        daily = self._safe_daily_df()
+        assert check_sell_signal(daily, "T", "n", "US")               is None
+        assert check_sell_signal(daily, "T", "n", "US",
+                                 weekly_df=None, benchmark_close=None) is None
+
+
 # ── 실행 ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import subprocess
