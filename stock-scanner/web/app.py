@@ -185,13 +185,22 @@ async def get_chart_ohlcv(
     else:
         from scanner.us_stocks import fetch_ohlcv
 
+    from scanner.errors import DataFetchError
     try:
         daily = fetch_ohlcv(ticker, lookback_days=fetch_days)
-    except Exception as e:
-        logger.warning(f"[chart] {market} {ticker} 페치 예외: {e}")
+    except DataFetchError as e:
+        # 외부 어댑터의 명시적 fetch 실패 → 503 (downstream 일시적 장애)
+        logger.warning(f"[chart] {market} {ticker} 외부 데이터 실패: {e}")
         return JSONResponse(
             {"detail": "외부 데이터 페치 실패", "market": market, "ticker": ticker},
             status_code=503,
+        )
+    except Exception as e:
+        # 그 외 예외 → 500 (서버 내부 버그)
+        logger.exception(f"[chart] {market} {ticker} 처리 중 내부 오류")
+        return JSONResponse(
+            {"detail": "내부 처리 오류", "market": market, "ticker": ticker},
+            status_code=500,
         )
 
     empty_response = {

@@ -53,15 +53,18 @@ class TestFetchOhlcvKR:
         assert captured["period_years"] == 2
         assert result is not None and len(result) == 120
 
-    def test_kr_fetch_handles_external_failure(self, monkeypatch):
+    def test_kr_fetch_raises_datafetcherror_on_external_failure(self, monkeypatch):
         from scanner import kr_stocks
+        from scanner.errors import DataFetchError
 
         def boom(ticker, period_years=2):
             raise RuntimeError("FDR 다운")
 
         monkeypatch.setattr(kr_stocks, "get_kr_ohlcv", boom)
 
-        assert kr_stocks.fetch_ohlcv("005930", lookback_days=365) is None
+        # Phase 4: 외부 장애는 명시적으로 raise — 호출자가 None 과 구분 가능
+        with pytest.raises(DataFetchError, match="KR fetch failed for 005930"):
+            kr_stocks.fetch_ohlcv("005930", lookback_days=365)
 
     def test_kr_fetch_zero_lookback_returns_none(self):
         from scanner import kr_stocks
@@ -103,15 +106,17 @@ class TestFetchOhlcvUS:
         assert captured["period"] == "2y"
         assert result is not None and len(result) == 120
 
-    def test_us_fetch_handles_external_failure(self, monkeypatch):
+    def test_us_fetch_raises_datafetcherror_on_external_failure(self, monkeypatch):
         from scanner import us_stocks
+        from scanner.errors import DataFetchError
 
         def boom(ticker, period="2y"):
             raise RuntimeError("yfinance 다운")
 
         monkeypatch.setattr(us_stocks, "get_us_ohlcv", boom)
 
-        assert us_stocks.fetch_ohlcv("AAPL", lookback_days=365) is None
+        with pytest.raises(DataFetchError, match="US fetch failed for AAPL"):
+            us_stocks.fetch_ohlcv("AAPL", lookback_days=365)
 
     def test_us_fetch_period_string_rounds_up(self, monkeypatch):
         from scanner import us_stocks
@@ -288,3 +293,97 @@ class TestMarketFilterRegression:
         from scanner.scan_engine import _get_market_filter_decision
         allow, msg = _get_market_filter_decision(None, "BREAKOUT")
         assert allow is True
+
+
+# ══════════════════════════════════════════════════════════════════
+# _save() — Mansfield rs_value 영속화 (Phase 2)
+# ══════════════════════════════════════════════════════════════════
+
+class TestSavePersistsMansfieldRS:
+    """`_save()` 가 legacy `rs` 가 아닌 Mansfield `rs_value` 를 DB 컬럼에 기록한다."""
+
+    def _fresh_db(self):
+        """SQLite in-memory + ScanResult 테이블만 사용하는 임시 세션."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from database.models import Base
+
+        eng = create_engine("sqlite:///:memory:",
+                            connect_args={"check_same_thread": False})
+        Base.metadata.create_all(eng)
+        Session = sessionmaker(bind=eng)
+        return Session()
+
+    def _signal(self, **overrides):
+        sig = {
+            "ticker":        "TEST",
+            "name":          "테스트",
+            "market":        "US",
+            "signal_type":   "BREAKOUT",
+            "stage":         "STAGE2",
+            "price":         105.0,
+            "ma150":         100.0,
+            "volume":        4_000_000,
+            "volume_avg":    1_000_000,
+            "volume_ratio":  4.0,
+            "signal_date":   "2024-06-03",
+            "pivot_price":   104.0,
+            "support_level": 99.0,
+            "market_condition": "BULL",
+            "signal_quality":   "STRONG",
+            "base_quality":     "STRONG",
+            # legacy ratio RS 와 Mansfield RS 를 동시에 채워 영속화 경로를 검증
+            "rs":          1.2,   # 절대 DB 에 들어가서는 안 됨
+            "rs_value":    6.0,   # 이 값이 ScanResult.rs_value 로 기록되어야 함
+            "rs_trend":    "RISING",
+        }
+        sig.update(overrides)
+        return sig
+
+    def test_save_writes_mansfield_rs_value_on_insert(self):
+        from scanner.scan_engine import _save
+        from database.models import ScanResult
+
+        db = self._fresh_db()
+        try:
+            _save(db, self._signal())
+            row = db.query(ScanResult).filter(
+                ScanResult.ticker == "TEST",
+                ScanResult.signal_date == "2024-06-03",
+            ).one()
+            assert row.rs_value == 6.0
+        finally:
+            db.close()
+
+    def test_save_updates_mansfield_rs_value_on_existing(self):
+        from scanner.scan_engine import _save
+        from database.models import ScanResult
+
+        db = self._fresh_db()
+        try:
+            _save(db, self._signal())
+            # 같은 (ticker, signal_date, signal_type) 로 두 번째 저장 → update 분기
+            _save(db, self._signal(rs=9.9, rs_value=12.5, price=108.0))
+            rows = db.query(ScanResult).filter(
+                ScanResult.ticker == "TEST",
+                ScanResult.signal_date == "2024-06-03",
+            ).all()
+            assert len(rows) == 1
+            assert rows[0].rs_value == 12.5
+            assert rows[0].price    == 108.0
+        finally:
+            db.close()
+
+    def test_save_writes_none_when_rs_value_missing(self):
+        from scanner.scan_engine import _save
+        from database.models import ScanResult
+
+        db = self._fresh_db()
+        try:
+            sig = self._signal()
+            sig.pop("rs_value")  # Mansfield 미산출 (벤치마크 없음 등)
+            _save(db, sig)
+            row = db.query(ScanResult).filter(ScanResult.ticker == "TEST").one()
+            assert row.rs_value is None  # legacy rs 1.2 가 잘못 기록되지 않아야 함
+        finally:
+            db.close()

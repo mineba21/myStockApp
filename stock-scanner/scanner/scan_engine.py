@@ -278,7 +278,7 @@ def _save(db, signal: dict):
             existing.support_level    = signal.get("support_level")
             existing.market_condition = signal.get("market_condition")
             existing.signal_quality   = signal.get("signal_quality")
-            existing.rs_value         = signal.get("rs")
+            existing.rs_value         = signal.get("rs_value")
             existing.grade            = grade
             existing.scan_time        = datetime.utcnow()
         else:
@@ -299,7 +299,7 @@ def _save(db, signal: dict):
                 support_level    = signal.get("support_level"),
                 market_condition = signal.get("market_condition"),
                 signal_quality   = signal.get("signal_quality"),
-                rs_value         = signal.get("rs"),
+                rs_value         = signal.get("rs_value"),
                 grade            = grade,
             ))
         db.commit()

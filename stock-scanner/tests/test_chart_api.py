@@ -171,17 +171,43 @@ class TestChartEmpty:
 
 
 class TestChartFetchError:
-    def test_external_exception_returns_503(self, client, monkeypatch):
+    def test_data_fetch_error_returns_503(self, client, monkeypatch):
+        """외부 어댑터의 명시적 DataFetchError → 503 (downstream 일시적 장애)."""
         from scanner import us_stocks
+        from scanner.errors import DataFetchError
 
         def boom(t, lookback_days=730):
-            raise RuntimeError("yfinance 다운")
+            raise DataFetchError("yfinance 다운")
 
         monkeypatch.setattr(us_stocks, "fetch_ohlcv", boom)
         r = client.get("/api/chart/ohlcv?market=US&ticker=AAPL&timeframe=daily&range=1y")
         assert r.status_code == 503
         body = r.json()
         assert "detail" in body
+
+    def test_unexpected_exception_returns_500(self, client, monkeypatch):
+        """그 외 예외(서버 내부 버그) → 500. 503 과 명확히 구분."""
+        from scanner import us_stocks
+
+        def boom(t, lookback_days=730):
+            raise RuntimeError("내부 버그")
+
+        monkeypatch.setattr(us_stocks, "fetch_ohlcv", boom)
+        r = client.get("/api/chart/ohlcv?market=US&ticker=AAPL&timeframe=daily&range=1y")
+        assert r.status_code == 500
+        body = r.json()
+        assert "detail" in body
+
+    def test_data_fetch_error_for_kr_market(self, client, monkeypatch):
+        from scanner import kr_stocks
+        from scanner.errors import DataFetchError
+
+        def boom(t, lookback_days=730):
+            raise DataFetchError("FDR 다운")
+
+        monkeypatch.setattr(kr_stocks, "fetch_ohlcv", boom)
+        r = client.get("/api/chart/ohlcv?market=KR&ticker=005930&timeframe=daily&range=1y")
+        assert r.status_code == 503
 
 
 # ══════════════════════════════════════════════════════════════════

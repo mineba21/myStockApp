@@ -139,7 +139,12 @@ def get_us_ohlcv(ticker: str, period: str = "2y") -> Optional[pd.DataFrame]:
 
 def fetch_ohlcv(ticker: str, lookback_days: int = 730) -> Optional[pd.DataFrame]:
     """Phase 2 통합 어댑터 — US 한정. lookback_days를 yfinance period 문자열로
-    환산해 기존 get_us_ohlcv()를 호출한다. 외부 페치 실패 시 None 반환.
+    환산해 기존 get_us_ohlcv()를 호출한다.
+
+    실패 정책 (Phase 4):
+      - lookback_days ≤ 0 → None (정상 빈 결과)
+      - get_us_ohlcv 가 None / 빈 DF 반환 → None (legitimately empty)
+      - 외부 어댑터 예외 → `DataFetchError` raise (호출자가 명시적으로 처리)
     """
     if lookback_days <= 0:
         return None
@@ -148,8 +153,9 @@ def fetch_ohlcv(ticker: str, lookback_days: int = 730) -> Optional[pd.DataFrame]
     try:
         return get_us_ohlcv(ticker, period=period)
     except Exception as e:
+        from scanner.errors import DataFetchError
         logger.debug(f"US fetch_ohlcv {ticker} 실패: {e}")
-        return None
+        raise DataFetchError(f"US fetch failed for {ticker}: {e}") from e
 
 
 def get_us_batch(tickers: list, progress_callback=None, delay: float = 0.1) -> list:
