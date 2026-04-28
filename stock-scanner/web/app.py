@@ -3,10 +3,11 @@ FastAPI 웹 애플리케이션
 """
 
 import logging
+import re
 import threading
 from datetime import datetime, timedelta
 from typing import Optional, List
-from fastapi import FastAPI, Request, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -130,6 +131,124 @@ async def delete_results_bulk(
     q.delete(synchronize_session=False)
     db.commit()
     return {"status": "deleted", "count": count}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  차트 API  (Phase 3 — 일봉/주봉 OHLCV + MA)
+# ═══════════════════════════════════════════════════════════════
+
+CHART_RANGE_DAYS = {"6m": 183, "1y": 365, "2y": 730, "5y": 1825}
+CHART_TICKER_RE = re.compile(r"^[A-Za-z0-9.\-]{1,15}$")
+
+
+@app.get("/api/chart/ohlcv")
+async def get_chart_ohlcv(
+    market: str = Query(..., description="KR 또는 US"),
+    ticker: str = Query(..., min_length=1, max_length=15),
+    timeframe: str = Query("daily", description="daily 또는 weekly"),
+    range: str = Query("1y", description="6m / 1y / 2y / 5y"),
+):
+    """스캔 결과 행에서 일봉/주봉 차트를 그릴 수 있는 OHLCV + MA JSON.
+
+    응답 스키마:
+      {
+        "market": "KR"|"US", "ticker": "...", "timeframe": "daily"|"weekly",
+        "range": "6m"|"1y"|"2y"|"5y",
+        "ma_period": 150 | 30,
+        "candles": [{"t","o","h","l","c","v","ma"}, ...]
+      }
+
+    on-demand 페치 — 스캔 시 차트 데이터를 사전 적재하지 않는다.
+    """
+    market = market.upper()
+    timeframe = timeframe.lower()
+    range_key = range.lower()
+
+    if market not in ("KR", "US"):
+        raise HTTPException(status_code=422, detail="market 은 KR 또는 US")
+    if timeframe not in ("daily", "weekly"):
+        raise HTTPException(status_code=422, detail="timeframe 은 daily 또는 weekly")
+    if range_key not in CHART_RANGE_DAYS:
+        raise HTTPException(status_code=422, detail=f"range 는 {list(CHART_RANGE_DAYS)}")
+    if not CHART_TICKER_RE.match(ticker):
+        raise HTTPException(status_code=422, detail="ticker 형식 (영숫자/점/하이픈, 1~15)")
+
+    # MA를 표시 범위 시작 지점에서도 채우기 위해 buffer 추가 페치
+    requested_days = CHART_RANGE_DAYS[range_key]
+    ma_period = 150 if timeframe == "daily" else 30
+    buffer_days = 250 if timeframe == "daily" else 225  # weekly 30주 ≈ 210일
+    fetch_days = requested_days + buffer_days
+
+    # Phase 2 fetch_ohlcv 어댑터 사용 (KR/US 라우팅)
+    if market == "KR":
+        from scanner.kr_stocks import fetch_ohlcv
+    else:
+        from scanner.us_stocks import fetch_ohlcv
+
+    from scanner.errors import DataFetchError
+    try:
+        daily = fetch_ohlcv(ticker, lookback_days=fetch_days)
+    except DataFetchError as e:
+        # 외부 어댑터의 명시적 fetch 실패 → 503 (downstream 일시적 장애)
+        logger.warning(f"[chart] {market} {ticker} 외부 데이터 실패: {e}")
+        return JSONResponse(
+            {"detail": "외부 데이터 페치 실패", "market": market, "ticker": ticker},
+            status_code=503,
+        )
+    except Exception as e:
+        # 그 외 예외 → 500 (서버 내부 버그)
+        logger.exception(f"[chart] {market} {ticker} 처리 중 내부 오류")
+        return JSONResponse(
+            {"detail": "내부 처리 오류", "market": market, "ticker": ticker},
+            status_code=500,
+        )
+
+    empty_response = {
+        "market": market, "ticker": ticker,
+        "timeframe": timeframe, "range": range_key,
+        "ma_period": ma_period, "candles": [],
+    }
+    if daily is None or len(daily) == 0:
+        return empty_response
+
+    if timeframe == "weekly":
+        from scanner.weinstein import to_weekly_ohlcv
+        df = to_weekly_ohlcv(daily)
+    else:
+        df = daily
+
+    if df is None or len(df) == 0:
+        return empty_response
+
+    import pandas as pd
+    df = df.copy()
+    df["ma"] = df["Close"].rolling(ma_period, min_periods=ma_period // 2).mean()
+
+    # 요청 범위로 trim — 마지막 인덱스 기준 requested_days 이내
+    last_ts = df.index.max()
+    cutoff = last_ts - pd.Timedelta(days=requested_days)
+    visible = df[df.index >= cutoff]
+    if len(visible) == 0:
+        visible = df  # 짧은 시리즈는 통째로 반환
+
+    candles = []
+    for idx, row in visible.iterrows():
+        ma_val = row["ma"]
+        candles.append({
+            "t": pd.Timestamp(idx).strftime("%Y-%m-%d"),
+            "o": float(row["Open"]),
+            "h": float(row["High"]),
+            "l": float(row["Low"]),
+            "c": float(row["Close"]),
+            "v": float(row["Volume"]),
+            "ma": (float(ma_val) if pd.notna(ma_val) else None),
+        })
+
+    return {
+        "market": market, "ticker": ticker,
+        "timeframe": timeframe, "range": range_key,
+        "ma_period": ma_period, "candles": candles,
+    }
 
 
 @app.get("/api/scan/logs")

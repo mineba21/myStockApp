@@ -20,8 +20,6 @@ _signal_quality(), _find_*() 는 legacy wrapper 로 그대로 동작.
 import numpy as np
 import pandas as pd
 from typing import Optional, Dict, Any, List, Tuple
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (
     MA_PERIOD, MA_SLOPE_PERIOD, VOLUME_AVG_PERIOD, SCAN_LOOKBACK_DAYS,
@@ -35,6 +33,12 @@ from config import (
     REBOUND_MA_PERIOD, REBOUND_TOUCH_PCT, REBOUND_CONFIRM_PCT,
     REBOUND_MAX_PULLBACK_PCT, REBOUND_REQUIRE_VOLUME_DRYUP,
 )
+
+# v4 REBOUND 게이트 (backward compat)
+try:
+    from config import REBOUND_REQUIRE_BASE_RETEST
+except ImportError:
+    REBOUND_REQUIRE_BASE_RETEST = True
 
 # v4 신규 파라미터 (backward compat: 없으면 기본값)
 try:
@@ -308,36 +312,85 @@ def detect_stage2_breakout(df: pd.DataFrame,
     """Stage1→Stage2 base pivot 상향 돌파 감지 (v4).
 
     조건:
-      - Stage == STAGE1 or STAGE2 (30w SMA 위 또는 근접)
-      - 최근 N 일 내 base pivot 상향 돌파
-      - 일봉 거래량 ≥ BREAKOUT_DAILY_VOL_RATIO
-      - (선택) 주봉 거래량 ≥ BREAKOUT_WEEKLY_VOL_RATIO
-      - MA150 대비 과매수 < 15%
-
-    반환: signal dict + warning_flags
+      - 주봉 데이터 존재 (weekly_ind is not None)
+      - Stage == STAGE1 or STAGE2 (30w SMA 위 + 상승)
+      - detect_base_pivot 으로 5주+ 이상 tight/loose base(폭 ≤15%) 확인
+      - 최근 SCAN_LOOKBACK_DAYS 내 pivot 상향 돌파
+      - 일봉 거래량 ≥ BREAKOUT_DAILY_VOL_RATIO (hard block)
+      - 주봉 거래량 ≥ BREAKOUT_WEEKLY_VOL_RATIO (hard block)
+      - MA150 대비 과매수 < BREAKOUT_MAX_EXTENDED_PCT
     """
-    if daily_ind is None:
+    if daily_ind is None or weekly_ind is None:
         return None
     stage = classify_stage(weekly_ind, daily_ind)
     if stage not in ("STAGE1", "STAGE2"):
         return None
 
-    # legacy 로직을 래핑 — 이미 검증된 _find_breakout_signal 사용
-    sig = _find_breakout_signal(daily_ind)
-    if sig is None:
+    wvr = float(weekly_ind.get("weekly_volume_ratio", 0.0) or 0.0)
+    if wvr < BREAKOUT_WEEKLY_VOL_RATIO:
         return None
 
-    warning_flags: List[str] = []
-    if weekly_ind is not None:
-        wvr = weekly_ind.get("weekly_volume_ratio", 0.0)
-        if wvr < BREAKOUT_WEEKLY_VOL_RATIO:
-            warning_flags.append(f"약한 주봉 거래량 ({wvr:.1f}x)")
+    close = df["Close"]
+    ma150 = daily_ind["ma150"]
+    ma50  = daily_ind["ma50"]
+    n     = len(close)
+
+    for i in range(1, min(SCAN_LOOKBACK_DAYS + 1, n)):
+        abs_i = n - i
+        if abs_i < 1:
+            continue
+
+        cp = float(close.iloc[abs_i])
+        pp = float(close.iloc[abs_i - 1])
+
+        df_pre = df.iloc[: abs_i + 1]
+        base = detect_base_pivot(df_pre,
+                                 lookback_weeks=PIVOT_LOOKBACK_WEEKS,
+                                 min_weeks=BASE_MIN_WEEKS)
+        if base is None or base["base_quality"] == "WIDE":
+            continue
+
+        pivot_price = float(base["pivot_price"])
+        if not (pp <= pivot_price < cp):
+            continue
+
+        cm150_raw = ma150.iloc[abs_i]
+        if pd.isna(cm150_raw) or float(cm150_raw) <= 0:
+            continue
+        cm150 = float(cm150_raw)
+        ext_pct = (cp - cm150) / cm150 * 100
+        if ext_pct > BREAKOUT_MAX_EXTENDED_PCT:
+            continue
+
+        dvr = _daily_vol_ratio(df, abs_i)
+        if dvr < BREAKOUT_DAILY_VOL_RATIO:
+            continue
+
+        cm50_raw = ma50.iloc[abs_i]
+        cm50 = float(cm50_raw) if not pd.isna(cm50_raw) else float(daily_ind["cur_m50"])
+
+        # legacy STRONG/WEAK 매핑 (scan_engine._grade 호환)
+        legacy_quality = "STRONG" if base["base_quality"] == "TIGHT" else "WEAK"
+
+        warning_flags: List[str] = []
         if stage == "STAGE1":
             warning_flags.append("STAGE1 → 2 전환 (조기 진입)")
 
-    sig["warning_flags"] = warning_flags
-    sig["stage_v4"]      = stage
-    return sig
+        return {
+            "signal_type":     "BREAKOUT",
+            "signal_date":     str(close.index[abs_i].date()),
+            "vol_ratio":       round(dvr, 2),
+            "pivot_price":     round(pivot_price, 4),
+            "support_level":   round(cm50, 4),
+            "base_quality":    legacy_quality,
+            "base_quality_v4": base["base_quality"],
+            "base_weeks":      base["base_weeks"],
+            "base_width_pct":  base["base_width_pct"],
+            "warning_flags":   warning_flags,
+            "stage_v4":        stage,
+        }
+
+    return None
 
 
 def detect_continuation_breakout(df: pd.DataFrame,
@@ -364,27 +417,135 @@ def detect_continuation_breakout(df: pd.DataFrame,
 def detect_rebound_entry(df: pd.DataFrame,
                          weekly_ind: Optional[Dict],
                          daily_ind: Optional[Dict]) -> Optional[Dict[str, Any]]:
-    """Stage2 MA50 눌림목 반등 감지 (시간순, v4)."""
+    """Stage2 MA50 눌림목 반등 감지 (시간순, v4).
+
+    Strategy invariants:
+      - 주봉 STAGE2 필수 (weekly_ind 없거나 STAGE2 아니면 거부).
+      - REBOUND_REQUIRE_BASE_RETEST=True 일 때:
+          (a) 직전 v4 base pivot 위에서의 MA50 눌림 OR
+          (b) 주봉 30-SMA 터치 + 회복 — 둘 중 하나 미충족 시 거부.
+    """
     if daily_ind is None:
         return None
+    if weekly_ind is None:
+        return None  # 주봉 데이터 없는 종목은 REBOUND 판정 금지
     stage = classify_stage(weekly_ind, daily_ind)
-    if stage not in ("STAGE2",):
-        # Stage3 는 legacy 에서 허용했지만 v4 는 엄격히 Stage2만
-        # legacy 호환을 위해 Stage3 일봉 허용
-        if daily_ind.get("stage") != "STAGE2":
-            return None
+    if stage != "STAGE2":
+        return None  # 일봉 fallback 제거 — 주봉 STAGE2 필수
 
-    sig = _find_rebound_signal(daily_ind)
+    sig = _find_rebound_signal_v4(df, daily_ind, weekly_ind)
     if sig is None:
         return None
 
     warning_flags: List[str] = []
-    if weekly_ind:
-        if weekly_ind.get("slope30w", 0) <= _FLAT_SLOPE:
-            warning_flags.append("주봉 30-SMA 기울기 둔화")
+    if weekly_ind.get("slope30w", 0) <= _FLAT_SLOPE:
+        warning_flags.append("주봉 30-SMA 기울기 둔화")
     sig["warning_flags"] = warning_flags
     sig["stage_v4"]      = stage
     return sig
+
+
+def _find_rebound_signal_v4(df: pd.DataFrame,
+                            daily_ind: Dict,
+                            weekly_ind: Dict) -> Optional[Dict]:
+    """v4 REBOUND: legacy MA50 touch+rebound + base/30w 재테스트 게이트.
+
+    1. legacy `_find_rebound_signal` 으로 후보 시그널 추출.
+    2. REBOUND_REQUIRE_BASE_RETEST=False → 그대로 통과.
+    3. True → 다음 두 조건 중 하나 이상 만족해야 통과:
+       (a) 직전 base pivot 위에서의 MA50 눌림: 터치 직전 일봉 종가 ≥ pivot_price
+       (b) 주봉 30-SMA 재테스트: 터치 일봉 종가가 cur_sma30w ±REBOUND_TOUCH_PCT
+           이내 + 시그널 시점 종가가 cur_sma30w 위로 회복.
+    """
+    legacy_sig = _find_rebound_signal(daily_ind)
+    if legacy_sig is None:
+        return None
+
+    if not REBOUND_REQUIRE_BASE_RETEST:
+        return legacy_sig
+
+    close = daily_ind["close"]
+    low   = daily_ind["low"]
+    ma50  = daily_ind["ma50"]
+    n = len(close)
+
+    # 시그널 위치(j_signal) 매핑
+    try:
+        sig_pos_raw = close.index.get_loc(pd.Timestamp(legacy_sig["signal_date"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if isinstance(sig_pos_raw, slice):
+        sig_pos = sig_pos_raw.start
+    else:
+        sig_pos = int(sig_pos_raw)
+    if sig_pos <= 0:
+        return None
+
+    # 터치 위치 추정: 시그널 직전 14일 윈도우에서 MA50 ±touch_pct 안에 들어간
+    # 가장 깊은 (low 가 m50 에 가장 가까운) 시점.
+    touch_pos = None
+    best_dist = None
+    win_lo = max(0, sig_pos - 14)
+    for k in range(win_lo, sig_pos):
+        if pd.isna(ma50.iloc[k]):
+            continue
+        m50_k = float(ma50.iloc[k])
+        if m50_k <= 0:
+            continue
+        l_k = float(low.iloc[k])
+        touch_lo = m50_k * (1.0 - REBOUND_MAX_PULLBACK_PCT / 100)
+        touch_hi = m50_k * (1.0 + REBOUND_TOUCH_PCT / 100)
+        if not (touch_lo <= l_k <= touch_hi):
+            continue
+        dist = abs(l_k - m50_k)
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            touch_pos = k
+    if touch_pos is None:
+        return None
+
+    # condition (a): 직전 base 위에서의 MA50 눌림
+    cond_a = False
+    base_meta = None
+    weekly_df = weekly_ind.get("weekly_df")
+    if weekly_df is not None and len(weekly_df) >= BASE_MIN_WEEKS + 1:
+        base = detect_base_pivot(
+            weekly_df,
+            lookback_weeks=PIVOT_LOOKBACK_WEEKS,
+            min_weeks=BASE_MIN_WEEKS,
+        )
+        if base is not None and base["base_quality"] != "WIDE":
+            pivot_price = float(base["pivot_price"])
+            pre_touch = touch_pos - 1
+            if pre_touch >= 0:
+                cp_pre = float(close.iloc[pre_touch])
+                if cp_pre >= pivot_price:
+                    cond_a = True
+                    base_meta = {
+                        "pivot_price":     pivot_price,
+                        "base_quality_v4": base["base_quality"],
+                        "base_weeks":      base["base_weeks"],
+                    }
+
+    # condition (b): 30w SMA 재테스트
+    cond_b = False
+    sma30w = float(weekly_ind.get("cur_sma30w") or 0.0)
+    if sma30w > 0:
+        tol = sma30w * REBOUND_TOUCH_PCT / 100
+        cp_touch = float(close.iloc[touch_pos])
+        cp_sig   = float(close.iloc[sig_pos])
+        if abs(cp_touch - sma30w) <= tol and cp_sig > sma30w:
+            cond_b = True
+
+    if not (cond_a or cond_b):
+        return None
+
+    legacy_sig["v4_gate"] = "BASE_RETEST" if cond_a else "30W_RETEST"
+    if base_meta is not None:
+        legacy_sig["pivot_price"]     = round(base_meta["pivot_price"], 4)
+        legacy_sig["base_quality_v4"] = base_meta["base_quality_v4"]
+        legacy_sig["base_weeks"]      = base_meta["base_weeks"]
+    return legacy_sig
 
 
 def detect_exit_warning(df: pd.DataFrame,
@@ -711,9 +872,19 @@ def _find_rebound_signal(ind: Dict) -> Optional[Dict]:
 
 # ── 신호 품질 계산 ─────────────────────────────────────────────────
 
-def _signal_quality(vol_ratio: float, slope: float, rs: Optional[float],
+def _signal_quality(vol_ratio: float, slope: float,
+                    rs_value: Optional[float], rs_trend: Optional[str],
                     signal_type: str) -> str:
-    """STRONG / MODERATE / WEAK 품질 점수 (legacy)."""
+    """STRONG / MODERATE / WEAK 품질 점수 (Mansfield RS 기준).
+
+    점수:
+      vol_ratio  ≥ 3.0 → +2 / ≥ 2.0 → +1
+      slope      > 0.10 → +2 / > 0.04 → +1
+      rs_value   ≥ +5 → +2 / ≥ 0 → +1 / < 0 → 0
+      rs_trend   RISING → +1 / FALLING → -1
+      signal_type BREAKOUT → +1
+      → ≥5 STRONG / ≥3 MODERATE / 그 외 WEAK
+    """
     score = 0
     if vol_ratio >= 3.0:  score += 2
     elif vol_ratio >= 2.0: score += 1
@@ -721,9 +892,12 @@ def _signal_quality(vol_ratio: float, slope: float, rs: Optional[float],
     if slope > 0.10:  score += 2
     elif slope > 0.04: score += 1
 
-    if rs is not None:
-        if rs >= 1.5:  score += 2
-        elif rs >= 1.0: score += 1
+    if rs_value is not None:
+        if rs_value >= 5.0:  score += 2
+        elif rs_value >= 0.0: score += 1
+
+    if rs_trend == "RISING":   score += 1
+    elif rs_trend == "FALLING": score -= 1
 
     if signal_type == "BREAKOUT": score += 1
 
@@ -793,8 +967,8 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
         )
         rs_legacy = calc_rs(daily_ind["close"], benchmark_close)
 
-    # signal_quality 는 legacy ratio RS 로 계산 (기존 테스트 호환)
-    qual = _signal_quality(sig["vol_ratio"], slope, rs_legacy, sig["signal_type"])
+    # signal_quality 는 Mansfield RS (rs_value/rs_trend) 기준
+    qual = _signal_quality(sig["vol_ratio"], slope, rs_value, rs_trend, sig["signal_type"])
 
     # warning_flags 축적
     warning_flags: List[str] = list(sig.get("warning_flags") or [])
@@ -827,7 +1001,7 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
         "base_quality":    sig.get("base_quality", "N/A"),
         "market_condition": market_condition,
         "signal_quality":  qual,
-        "rs_passed":       (rs_legacy is not None and rs_legacy >= 1.0),
+        "rs_passed":       (rs_value is not None and rs_value >= 0.0),
         "warning_flags":   warning_flags,
     }
     if weekly_ind is not None:
@@ -837,9 +1011,52 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
     return result
 
 
+def _weekly_breakdown(weekly_df: Optional[pd.DataFrame]) -> bool:
+    """현재 주봉 종가가 30주 SMA 아래로 이탈했는지 (true weekly path)."""
+    if weekly_df is None or len(weekly_df) < WEEKLY_MA_LONG:
+        return False
+    ind = compute_weekly_indicators(weekly_df)
+    if ind is None:
+        return False
+    return ind["cur_close_w"] < ind["cur_sma30w"]
+
+
+def _weekly_slope_reversal(weekly_df: Optional[pd.DataFrame]) -> bool:
+    """주봉 30-SMA 기울기가 양→음으로 반전했는지 (현재 ≤ 0, 5주 전 > 0)."""
+    if weekly_df is None or len(weekly_df) < WEEKLY_MA_LONG + 5:
+        return False
+    sma30 = (weekly_df["Close"]
+             .rolling(WEEKLY_MA_LONG, min_periods=WEEKLY_MA_LONG // 2)
+             .mean()
+             .dropna())
+    if len(sma30) < MA_SLOPE_PERIOD + 5:
+        return False
+    cur_slope  = _slope(sma30,           n=MA_SLOPE_PERIOD)
+    past_slope = _slope(sma30.iloc[:-5], n=MA_SLOPE_PERIOD)
+    return past_slope > 0 and cur_slope <= 0
+
+
+def _rs_deteriorating(close: pd.Series,
+                      benchmark_close: Optional[pd.Series]) -> bool:
+    """Mansfield RS < 0 AND 추세 == FALLING."""
+    if benchmark_close is None:
+        return False
+    rs_value, rs_trend = compute_relative_performance(close, benchmark_close)
+    if rs_value is None:
+        return False
+    return rs_value < 0 and rs_trend == "FALLING"
+
+
 def check_sell_signal(df: pd.DataFrame, ticker: str, name: str, market: str,
-                      buy_price: float = None, stop_loss: float = None) -> Optional[dict]:
-    """감시 종목 매도 시그널 체크 (severity: HIGH / MEDIUM / LOW)."""
+                      buy_price: float = None, stop_loss: float = None,
+                      weekly_df: Optional[pd.DataFrame] = None,
+                      benchmark_close: Optional[pd.Series] = None) -> Optional[dict]:
+    """감시 종목 매도 시그널 체크 (severity: HIGH / MEDIUM / LOW).
+
+    옵션 인자 weekly_df / benchmark_close 가 제공되면 30주 SMA 붕괴/슬로프
+    반전/Mansfield RS 악화 분기를 추가로 평가한다. 인자가 None 이면 기존 결과를
+    그대로 유지하므로 Phase 1 단독 머지 시 호출부 회귀가 없다.
+    """
     if df is None or len(df) < MA_PERIOD + 20:
         return None
 
@@ -859,6 +1076,10 @@ def check_sell_signal(df: pd.DataFrame, ticker: str, name: str, market: str,
         reason   = f"손절가 도달 (현재 {cur_p:,.0f} ≤ 손절 {stop_loss:,.0f})"
         severity = "HIGH"
 
+    elif _weekly_breakdown(weekly_df):
+        reason   = "주봉 30-SMA 하향 이탈"
+        severity = "HIGH"
+
     elif stage == "STAGE4":
         for i in range(1, 4):
             pp = float(close.iloc[-i - 1])
@@ -873,6 +1094,14 @@ def check_sell_signal(df: pd.DataFrame, ticker: str, name: str, market: str,
         if slope_past > 0 and slope <= 0:
             reason   = "MA150 기울기 반전 (상승 추세 약화)"
             severity = "MEDIUM"
+
+    if reason is None and _weekly_slope_reversal(weekly_df):
+        reason   = "주봉 30-SMA 기울기 반전"
+        severity = "MEDIUM"
+
+    if reason is None and _rs_deteriorating(close, benchmark_close):
+        reason   = "상대강도(Mansfield RS) 악화"
+        severity = "MEDIUM"
 
     if reason is None and stage == "STAGE3":
         reason   = "Stage3 진입 징후 (고점 부근, 분배 주의)"

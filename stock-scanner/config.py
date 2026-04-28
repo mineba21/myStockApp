@@ -36,6 +36,9 @@ REBOUND_CONFIRM_PCT          = float(os.getenv("REBOUND_CONFIRM_PCT", "2.0"))  #
 REBOUND_MAX_PULLBACK_PCT     = float(os.getenv("REBOUND_MAX_PULLBACK_PCT", "12.0"))
 REBOUND_REQUIRE_VOLUME_DRYUP = os.getenv("REBOUND_REQUIRE_VOLUME_DRYUP", "false").lower() == "true"
 REBOUND_ALLOW_PIVOT_RETEST   = os.getenv("REBOUND_ALLOW_PIVOT_RETEST", "true").lower() == "true"
+# v4 게이트: REBOUND 시 직전 base 재테스트 OR 주봉 30-SMA 터치+회복 강제 여부.
+# 운영에서 시그널 수가 너무 줄면 False 로 토글 가능 (단 strategy invariant 위반).
+REBOUND_REQUIRE_BASE_RETEST  = os.getenv("REBOUND_REQUIRE_BASE_RETEST", "true").lower() == "true"
 
 # ── Market Filter (시장 필터) ────────────────────────────────────
 ENABLE_MARKET_FILTER   = os.getenv("ENABLE_MARKET_FILTER", "true").lower() == "true"

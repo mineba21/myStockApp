@@ -136,6 +136,26 @@ def get_kr_ohlcv(ticker: str, period_years: int = 2) -> Optional[pd.DataFrame]:
     return None
 
 
+def fetch_ohlcv(ticker: str, lookback_days: int = 730) -> Optional[pd.DataFrame]:
+    """Phase 2 통합 어댑터 — KR 한정. lookback_days를 period_years로 환산해
+    기존 get_kr_ohlcv()를 호출한다.
+
+    실패 정책 (Phase 4):
+      - lookback_days ≤ 0 → None (정상 빈 결과)
+      - get_kr_ohlcv 가 None / 빈 DF 반환 → None (legitimately empty)
+      - 외부 어댑터 예외 → `DataFetchError` raise (호출자가 명시적으로 처리)
+    """
+    if lookback_days <= 0:
+        return None
+    period_years = max(1, (lookback_days + 364) // 365)
+    try:
+        return get_kr_ohlcv(ticker, period_years=period_years)
+    except Exception as e:
+        from scanner.errors import DataFetchError
+        logger.debug(f"KR fetch_ohlcv {ticker} 실패: {e}")
+        raise DataFetchError(f"KR fetch failed for {ticker}: {e}") from e
+
+
 def get_kr_batch(tickers: list, progress_callback=None, delay: float = 0.05) -> list:
     results = []
     for i, info in enumerate(tickers):

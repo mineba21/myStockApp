@@ -37,7 +37,7 @@ class ScanResult(Base):
     support_level    = Column(Float,       nullable=True)   # MA50 지지선
     market_condition = Column(String(20),  nullable=True)   # BULL/BEAR/CAUTION/NEUTRAL
     signal_quality   = Column(String(10),  nullable=True)   # STRONG/MODERATE/WEAK
-    rs_value         = Column(Float,       nullable=True)   # 상대강도 값
+    rs_value         = Column(Float,       nullable=True)   # Mansfield RS (v4)
     grade            = Column(String(5),   nullable=True)   # S/A/B 종합 등급
 
 
