@@ -82,3 +82,50 @@
 
 - 전략 함수는 합성 pandas 데이터로 단위 테스트 가능해야 한다.
 - 외부 데이터 라이브러리(yfinance, pykrx, FDR)에 의존하는 테스트는 통합 테스트로 분리.
+
+
+# docs/strategy/weinstein.md Strict Policy Patch
+
+Add or replace the relevant section in `docs/strategy/weinstein.md` with the following policy.
+
+---
+
+## 엄격 최적 매수 필터 정책
+
+운영 모드가 `STRICT_WEINSTEIN_MODE=true`일 때, BUY 신호는 후보 점수가 아니라 하드 필터 결과다.
+
+다음 조건 중 하나라도 실패하면 BUY 신호를 저장, 알림, 표시하지 않는다.
+
+- 시장이 BEAR 또는 확인 불가
+- 섹터가 Stage 2가 아님
+- 섹터 확인이 필요한데 섹터가 UNKNOWN
+- 종목 주봉 종가가 30주 SMA 아래
+- 30주 SMA 기울기가 하락 중
+- Stage 3 또는 Stage 4
+- 유효한 base/pivot이 없음
+- 돌파 거래량이 기준 미달
+- Mansfield RS가 0 미만
+- Mansfield RS 추세가 하락
+- BREAKOUT에서 최근 RS 0선 돌파가 없음
+- 가격이 과도하게 이격
+- 사전 손절선 산출 불가
+
+`warning_flags`는 보조 진단용이며, 필수 조건 실패를 대체할 수 없다.
+
+---
+
+## 엄격 BUY 체크리스트
+
+엄격 BUY는 아래 항목이 모두 `Yes`일 때만 성립한다.
+
+1. 전체 시장이 Stage 2 또는 최소한 Stage 4가 아닌가?
+2. 해당 섹터가 Stage 2인가?
+3. 종목이 주봉 30-SMA 위에 있고 30-SMA가 상승 또는 비하락 상태인가?
+4. 장기간 base/pivot 저항을 상향 돌파했는가, 또는 Stage 2 내 유효한 pullback/retest인가?
+5. 돌파 주봉 거래량이 최근 평균 대비 최소 2배 이상인가?
+6. Mansfield RS가 0 이상이고 상승 또는 비하락 상태인가?
+7. BREAKOUT의 경우 최근 RS 0선 상향 돌파 또는 명확한 양전환이 있었는가?
+8. 가격이 30주선/150일선 대비 과도하게 이격되지 않았는가?
+9. 사전 손절선이 명확히 산출되었는가?
+
+이 체크리스트 중 하나라도 실패하면 엄격 BUY가 아니다.
