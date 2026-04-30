@@ -236,6 +236,138 @@ def compute_relative_performance(close: pd.Series,
         return None, None
 
 
+def detect_rs_zero_cross(close: pd.Series,
+                         benchmark_close: pd.Series,
+                         lookback_weeks: Optional[int] = None) -> bool:
+    """Mansfield Relative Strength 가 최근 N주 안에 0선을 음→양 으로 전환했는지.
+
+    엄격 매수 필터(Gate 6, Phase 2) 의 RS zero-cross 판정용 순수 함수.
+
+    인접 두 점 (prev, curr) 가 (prev <= 0 and curr > 0) 면 zero-cross 로 본다.
+    benchmark 결측·데이터 부족·예외 발생 시 모두 False 로 안전 폴백.
+
+    Args:
+        close:           종목 일봉 Close 시리즈.
+        benchmark_close: 벤치마크(예: SPY) 일봉 Close 시리즈.
+        lookback_weeks:  검사 윈도우(주). 기본값은 config.RS_ZERO_CROSS_LOOKBACK_WEEKS.
+
+    Returns:
+        bool — 윈도우 내 음→양 전환이 한 번이라도 있으면 True.
+    """
+    from config import RS_ZERO_CROSS_LOOKBACK_WEEKS as _DEFAULT_LB
+    if lookback_weeks is None:
+        lookback_weeks = _DEFAULT_LB
+
+    if close is None or benchmark_close is None:
+        return False
+    try:
+        aligned = pd.DataFrame({
+            "s": close.astype(float),
+            "b": benchmark_close.astype(float),
+        }).dropna()
+        # SMA52 계산이 가능해야 의미 있음
+        if len(aligned) < RS_LOOKBACK_WEEKS * 5:
+            return False
+
+        ratio = aligned["s"] / aligned["b"].replace(0, np.nan)
+        ratio = ratio.dropna()
+        if len(ratio) < RS_LOOKBACK_WEEKS * 5:
+            return False
+
+        win = RS_LOOKBACK_WEEKS * 5
+        sma = ratio.rolling(win, min_periods=win // 2).mean()
+        rs_series = (ratio / sma - 1.0) * 100.0
+        rs_series = rs_series.dropna()
+        if len(rs_series) < 2:
+            return False
+
+        window_days = lookback_weeks * 5
+        recent = rs_series.iloc[-window_days:]
+        if len(recent) < 2:
+            return False
+
+        prev = recent.shift(1)
+        crossed = ((prev <= 0) & (recent > 0)).any()
+        return bool(crossed)
+    except Exception:
+        return False
+
+
+def compute_stop_loss(signal: Dict[str, Any],
+                      daily_ind: Optional[Dict[str, Any]] = None,
+                      weekly_ind: Optional[Dict[str, Any]] = None
+                      ) -> Optional[float]:
+    """Strict Weinstein Gate 8 — BUY 시그널의 손절가 계산.
+
+    signal_type 별 후보 우선순위 (앞이 우선; 첫 번째로 *price 미만* 인 값 사용):
+
+        BREAKOUT     base_low * 0.99  →  pivot_price * 0.97  →  cur_sma30w * 0.97
+        RE_BREAKOUT  swing_low(30d) * 0.99  →  cur_m50 * 0.97
+        REBOUND      cur_sma30w * 0.97  →  cur_m50 * 0.97
+
+    모든 후보가 None 또는 >= price 면 None 반환 → strict 필터에서
+    `stop_loss_missing` / `stop_loss_above_price` 거부 사유 트리거.
+
+    Args:
+        signal:     analyze_stock 또는 detect_* 가 반환한 시그널 dict.
+                    필요 키: signal_type, price, pivot_price, base_low.
+        daily_ind:  _build_indicators() 출력 (cur_m50, low 시리즈 사용).
+        weekly_ind: compute_weekly_indicators() 출력 (cur_sma30w 사용).
+    """
+    price = signal.get("price")
+    try:
+        price = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        price = None
+    if price is None or price <= 0:
+        return None
+
+    sig_type = signal.get("signal_type")
+    candidates: List[Optional[float]] = []
+
+    if sig_type == "BREAKOUT":
+        bl = signal.get("base_low")
+        if bl is not None:
+            candidates.append(float(bl) * 0.99)
+        pp = signal.get("pivot_price")
+        if pp is not None:
+            candidates.append(float(pp) * 0.97)
+        if weekly_ind is not None:
+            sma30w = weekly_ind.get("cur_sma30w")
+            if sma30w is not None:
+                candidates.append(float(sma30w) * 0.97)
+
+    elif sig_type == "RE_BREAKOUT":
+        if daily_ind is not None:
+            low_series = daily_ind.get("low")
+            if low_series is not None and len(low_series) >= 30:
+                try:
+                    swing = float(low_series.iloc[-30:].min())
+                    if swing > 0:
+                        candidates.append(swing * 0.99)
+                except Exception:
+                    pass
+            cm50 = daily_ind.get("cur_m50")
+            if cm50 is not None:
+                candidates.append(float(cm50) * 0.97)
+
+    elif sig_type == "REBOUND":
+        if weekly_ind is not None:
+            sma30w = weekly_ind.get("cur_sma30w")
+            if sma30w is not None:
+                candidates.append(float(sma30w) * 0.97)
+        if daily_ind is not None:
+            cm50 = daily_ind.get("cur_m50")
+            if cm50 is not None:
+                candidates.append(float(cm50) * 0.97)
+
+    # 첫 sane 후보 (price 미만) 채택
+    for cand in candidates:
+        if cand is not None and cand < price:
+            return round(float(cand), 4)
+    return None
+
+
 def detect_base_pivot(df: pd.DataFrame,
                       lookback_weeks: int = PIVOT_LOOKBACK_WEEKS,
                       min_weeks: int = BASE_MIN_WEEKS) -> Optional[Dict[str, Any]]:
@@ -386,6 +518,7 @@ def detect_stage2_breakout(df: pd.DataFrame,
             "base_quality_v4": base["base_quality"],
             "base_weeks":      base["base_weeks"],
             "base_width_pct":  base["base_width_pct"],
+            "base_low":        base["base_low"],   # Phase 2 — compute_stop_loss 1순위
             "warning_flags":   warning_flags,
             "stage_v4":        stage,
         }
@@ -958,14 +1091,55 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
 
     pct = (cur_p - cur_m150) / cur_m150 * 100 if cur_m150 else 0.0
 
-    # ── Mansfield RS (v4) + legacy ratio RS ──
+    # ── signal_date 시점까지의 데이터 슬라이스 (Phase 2 — no-look-ahead) ──
+    # detect_* 는 SCAN_LOOKBACK_DAYS 안의 *과거* bar 에서 신호를 잡을 수 있어
+    # df.index[-1] 가 아닌 sig["signal_date"] 가 진짜 신호 시점이다.
+    # signal 은 시점 스냅샷이므로, RS / stop_loss / signal_quality / warning
+    # 모두 *signal 발생 시점* 의 시리즈로 산출해야 한다 (CLAUDE.md "Stage 2
+    # candidates ... no look-ahead pivot"). DB 에 기록되는 rs_value/rs_trend
+    # 도 이 신호의 RS 스냅샷이지, 스캔 직전 마지막 bar 의 RS 가 아니다.
+    df_at_signal     = df.loc[: sig["signal_date"]]
+    daily_at_signal  = daily_ind
+    weekly_at_signal = weekly_ind
+    if len(df_at_signal) >= MA_PERIOD:
+        d_signal = _build_indicators(df_at_signal)
+        if d_signal is not None:
+            daily_at_signal = d_signal
+        w_signal_df = to_weekly_ohlcv(df_at_signal)
+        if len(w_signal_df) > 0:
+            w_signal = compute_weekly_indicators(w_signal_df)
+            if w_signal is not None:
+                weekly_at_signal = w_signal
+
+    # signal 시점 close — stop_loss sanity 비교 (stop < price) 가 일관되도록.
+    sig_close = float(df_at_signal["Close"].iloc[-1]) if len(df_at_signal) else cur_p
+
+    # ── Mansfield RS (v4) + legacy ratio RS — signal 시점까지의 시리즈로 산출 ──
     rs_value, rs_trend = (None, None)
     rs_legacy = None
+    rs_zero_crossed: Optional[bool] = None
     if benchmark_close is not None:
+        bench_at_signal = benchmark_close.loc[: sig["signal_date"]]
         rs_value, rs_trend = compute_relative_performance(
-            daily_ind["close"], benchmark_close, lookback_weeks=RS_LOOKBACK_WEEKS
+            daily_at_signal["close"], bench_at_signal, lookback_weeks=RS_LOOKBACK_WEEKS
         )
-        rs_legacy = calc_rs(daily_ind["close"], benchmark_close)
+        rs_legacy = calc_rs(daily_at_signal["close"], bench_at_signal)
+        # Strict Gate 6 — RS 0선 음→양 zero-cross
+        rs_zero_crossed = detect_rs_zero_cross(
+            daily_at_signal["close"], bench_at_signal
+        )
+
+    # ── Phase 2 — Strict Gate 8 손절가 계산 (signal 시점 indicator 사용) ──
+    stop_loss = compute_stop_loss(
+        {
+            "signal_type": sig["signal_type"],
+            "price":       sig_close,
+            "pivot_price": sig.get("pivot_price"),
+            "base_low":    sig.get("base_low"),
+        },
+        daily_ind=daily_at_signal,
+        weekly_ind=weekly_at_signal,
+    )
 
     # signal_quality 는 Mansfield RS (rs_value/rs_trend) 기준
     qual = _signal_quality(sig["vol_ratio"], slope, rs_value, rs_trend, sig["signal_type"])
@@ -1003,11 +1177,13 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
         "signal_quality":  qual,
         "rs_passed":       (rs_value is not None and rs_value >= 0.0),
         "warning_flags":   warning_flags,
-        # ── Strict Weinstein filter (Phase 1 scaffold; 후속 phase 에서 채워짐) ──
-        # stop_loss            : Phase 2 — compute_stop_loss() 로 계산
+        # ── Strict Weinstein filter ──
+        # stop_loss            : Phase 2 — compute_stop_loss() 로 계산 (price 미만 후보 없으면 None)
+        # rs_zero_crossed      : Phase 2 — detect_rs_zero_cross() (벤치마크 없으면 None)
         # strict_filter_passed : Phase 4 — scan_engine 에서 apply_strict_filter() 결과로 채움
         # filter_reasons       : Phase 4 — 거부 사유 enum 문자열 리스트
-        "stop_loss":            None,
+        "stop_loss":            stop_loss,
+        "rs_zero_crossed":      rs_zero_crossed,
         "strict_filter_passed": None,
         "filter_reasons":       [],
     }
