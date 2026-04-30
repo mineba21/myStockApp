@@ -12,6 +12,7 @@ monkeypatch로 외부 의존(DB, KR/US 페치, telegram, market_analysis)을 차
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import json
 from datetime import date, timedelta
 import pandas as pd
 import pytest
@@ -387,3 +388,181 @@ class TestSavePersistsMansfieldRS:
             assert row.rs_value is None  # legacy rs 1.2 가 잘못 기록되지 않아야 함
         finally:
             db.close()
+
+
+# ══════════════════════════════════════════════════════════════════
+# Strict Weinstein filter — Phase 1: DB 영속화 스캐폴드
+# ══════════════════════════════════════════════════════════════════
+
+class TestSavePersistsStrictFields:
+    """`_save()` 가 Phase 1 신설 7개 컬럼 (stop_loss, sector_name, sector_stage,
+    rs_trend, rs_zero_crossed, strict_filter_passed, filter_reasons) 을
+    INSERT/UPDATE 양쪽에서 정상 기록하는지 검증.
+
+    Phase 1 단계에서는 signal dict 가 해당 키를 비워둔 채(None/[]) 들어와도
+    DB 컬럼은 NULL 로 안전하게 들어가야 한다 (no-op 보장).
+    """
+
+    def _fresh_db(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from database.models import Base
+
+        eng = create_engine("sqlite:///:memory:",
+                            connect_args={"check_same_thread": False})
+        Base.metadata.create_all(eng)
+        Session = sessionmaker(bind=eng)
+        return Session()
+
+    def _signal(self, **overrides):
+        sig = {
+            "ticker":        "STR",
+            "name":          "Strict",
+            "market":        "US",
+            "signal_type":   "BREAKOUT",
+            "stage":         "STAGE2",
+            "price":         110.0,
+            "ma150":         100.0,
+            "volume":        5_000_000,
+            "volume_avg":    1_000_000,
+            "volume_ratio":  5.0,
+            "signal_date":   "2024-07-01",
+            "pivot_price":   108.0,
+            "support_level": 100.0,
+            "market_condition": "BULL",
+            "signal_quality":   "STRONG",
+            "rs_value":      4.5,
+        }
+        sig.update(overrides)
+        return sig
+
+    def test_save_writes_null_when_strict_fields_absent(self):
+        """signal dict 에 strict 키가 없거나 None 이면 DB 7개 컬럼 모두 NULL."""
+        from scanner.scan_engine import _save
+        from database.models import ScanResult
+
+        db = self._fresh_db()
+        try:
+            _save(db, self._signal())  # strict 키 미포함
+            row = db.query(ScanResult).filter(ScanResult.ticker == "STR").one()
+            assert row.stop_loss            is None
+            assert row.sector_name          is None
+            assert row.sector_stage         is None
+            assert row.rs_trend             is None
+            assert row.rs_zero_crossed      is None
+            assert row.strict_filter_passed is None
+            assert row.filter_reasons       is None
+        finally:
+            db.close()
+
+    def test_save_persists_strict_fields_on_insert(self):
+        """signal 이 strict 키를 채워주면 INSERT 경로가 그대로 영속화."""
+        from scanner.scan_engine import _save
+        from database.models import ScanResult
+
+        db = self._fresh_db()
+        try:
+            sig = self._signal(
+                stop_loss            = 102.5,
+                sector_name          = "Technology",
+                sector_stage         = "STAGE2",
+                rs_trend             = "RISING",
+                rs_zero_crossed      = True,
+                strict_filter_passed = True,
+                filter_reasons       = [],   # pass → JSON 직렬화 결과는 None
+            )
+            _save(db, sig)
+            row = db.query(ScanResult).filter(ScanResult.ticker == "STR").one()
+            assert row.stop_loss            == 102.5
+            assert row.sector_name          == "Technology"
+            assert row.sector_stage         == "STAGE2"
+            assert row.rs_trend             == "RISING"
+            assert row.rs_zero_crossed      is True
+            assert row.strict_filter_passed is True
+            # 빈 리스트는 NULL 로 정규화 (의미 없는 "[]" 저장 방지)
+            assert row.filter_reasons       is None
+        finally:
+            db.close()
+
+    def test_save_serializes_filter_reasons_and_updates_existing(self):
+        """거부 사유 리스트는 JSON 으로 직렬화되며, 동일 키 재호출 시 UPDATE 분기도 동일하게 채운다."""
+        from scanner.scan_engine import _save
+        from database.models import ScanResult
+
+        db = self._fresh_db()
+        try:
+            # 1차: 거부 시그널 (strict_filter_passed=False, 사유 2개)
+            _save(db, self._signal(
+                strict_filter_passed = False,
+                filter_reasons       = ["rs_below_zero", "below_weekly_30ma"],
+                rs_trend             = "FALLING",
+            ))
+            row = db.query(ScanResult).filter(ScanResult.ticker == "STR").one()
+            assert row.strict_filter_passed is False
+            assert row.rs_trend             == "FALLING"
+            # JSON 문자열이 정상 round-trip
+            decoded = json.loads(row.filter_reasons)
+            assert decoded == ["rs_below_zero", "below_weekly_30ma"]
+
+            # 2차: 같은 (ticker, signal_date, signal_type) 재호출 → UPDATE 분기 검증
+            _save(db, self._signal(
+                strict_filter_passed = True,
+                filter_reasons       = [],
+                rs_trend             = "RISING",
+                stop_loss            = 105.0,
+            ))
+            rows = db.query(ScanResult).filter(ScanResult.ticker == "STR").all()
+            assert len(rows) == 1, "UPSERT 의도 — 한 행으로 합쳐져야 함"
+            assert rows[0].strict_filter_passed is True
+            assert rows[0].rs_trend             == "RISING"
+            assert rows[0].stop_loss            == 105.0
+            assert rows[0].filter_reasons       is None
+        finally:
+            db.close()
+
+    def test_migrate_adds_missing_strict_columns_to_legacy_db(self):
+        """기존 DB(strict 컬럼 누락)에 _migrate() 적용 시 7개 컬럼이 모두 추가되어야 한다."""
+        from sqlalchemy import create_engine, text, inspect
+        # 임시 파일 SQLite (in-memory 는 다중 연결이 별도 DB)
+        import tempfile, os as _os
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            url = f"sqlite:///{tmp.name}"
+            eng = create_engine(url, connect_args={"check_same_thread": False})
+
+            # 1) strict 컬럼이 없는 legacy 형태로 테이블 생성
+            #    (SQLAlchemy 1.4 legacy 모드 — DDL 은 자동 커밋)
+            with eng.connect() as conn:
+                conn.execute(text("""
+                    CREATE TABLE scan_results (
+                        id INTEGER PRIMARY KEY,
+                        scan_time DATETIME, market VARCHAR(10),
+                        ticker VARCHAR(20), name VARCHAR(100),
+                        signal_type VARCHAR(20), stage VARCHAR(10),
+                        price REAL, ma150 REAL,
+                        volume REAL, volume_avg REAL, volume_ratio REAL,
+                        signal_date VARCHAR(10), notified BOOLEAN
+                    )
+                """))
+
+            # 2) 동일 DB URL 로 _migrate() 실행 — engine 을 monkeypatch
+            from database import models as _models
+            orig_engine = _models.engine
+            _models.engine = eng
+            try:
+                _models._migrate()
+            finally:
+                _models.engine = orig_engine
+
+            # 3) ALTER 적용 확인
+            cols = {c["name"] for c in inspect(eng).get_columns("scan_results")}
+            need = {
+                "stop_loss", "sector_name", "sector_stage",
+                "rs_trend", "rs_zero_crossed",
+                "strict_filter_passed", "filter_reasons",
+            }
+            missing = need - cols
+            assert not missing, f"_migrate() 가 추가 못한 컬럼: {missing}"
+        finally:
+            _os.unlink(tmp.name)
