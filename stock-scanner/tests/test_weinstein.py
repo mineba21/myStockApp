@@ -1255,6 +1255,154 @@ class TestSignalQualityMansfield:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Strict Weinstein filter — Phase 2: stop-loss + RS zero-cross helpers
+# ═══════════════════════════════════════════════════════════════════
+
+class TestStopLoss:
+    """compute_stop_loss() — signal_type 별 후보 우선순위 검증."""
+
+    def test_breakout_uses_base_low_first(self):
+        from scanner.weinstein import compute_stop_loss
+        sig = {
+            "signal_type": "BREAKOUT",
+            "price":       105.0,
+            "pivot_price": 104.0,
+            "base_low":    98.0,
+        }
+        # 1순위: base_low * 0.99 = 97.02
+        sl = compute_stop_loss(sig, daily_ind=None,
+                               weekly_ind={"cur_sma30w": 90.0})
+        assert sl is not None
+        assert abs(sl - 97.02) < 1e-6
+
+    def test_breakout_falls_back_to_pivot_when_no_base_low(self):
+        from scanner.weinstein import compute_stop_loss
+        sig = {
+            "signal_type": "BREAKOUT",
+            "price":       105.0,
+            "pivot_price": 104.0,
+            # base_low 없음
+        }
+        sl = compute_stop_loss(sig, daily_ind=None,
+                               weekly_ind={"cur_sma30w": 90.0})
+        # 2순위: pivot_price * 0.97 = 100.88
+        assert sl is not None
+        assert abs(sl - 100.88) < 1e-6
+
+    def test_rebound_uses_sma30w(self):
+        from scanner.weinstein import compute_stop_loss
+        sig = {
+            "signal_type": "REBOUND",
+            "price":       100.0,
+        }
+        sl = compute_stop_loss(sig,
+                               daily_ind={"cur_m50": 95.0},
+                               weekly_ind={"cur_sma30w": 90.0})
+        # 1순위: cur_sma30w * 0.97 = 87.3
+        assert sl is not None
+        assert abs(sl - 87.3) < 1e-6
+
+    def test_rebreakout_uses_swing_low(self):
+        from scanner.weinstein import compute_stop_loss
+        # 최근 30일 low 시리즈 — 최저 92.0
+        n = 60
+        idx = pd.date_range("2024-01-01", periods=n)
+        lows = pd.Series([100.0] * (n - 30) + [92.0] + [100.0] * 29, index=idx)
+        sig = {
+            "signal_type": "RE_BREAKOUT",
+            "price":       105.0,
+        }
+        sl = compute_stop_loss(sig,
+                               daily_ind={"low": lows, "cur_m50": 96.0},
+                               weekly_ind=None)
+        # 1순위: swing_low * 0.99 = 92 * 0.99 = 91.08
+        assert sl is not None
+        assert abs(sl - 91.08) < 1e-6
+
+    def test_returns_none_when_all_candidates_above_price(self):
+        from scanner.weinstein import compute_stop_loss
+        # base_low * 0.99 = 99 → price=100 보다 작음. price 를 더 낮춰서 실패 유도
+        sig = {
+            "signal_type": "BREAKOUT",
+            "price":       80.0,    # 모든 후보 (97.02, 100.88, 87.3) 가 price 이상
+            "pivot_price": 104.0,
+            "base_low":    98.0,
+        }
+        sl = compute_stop_loss(sig, daily_ind=None,
+                               weekly_ind={"cur_sma30w": 90.0})
+        assert sl is None
+
+    def test_analyze_stock_breakout_includes_stop_loss(self):
+        """analyze_stock 결과에 stop_loss 가 실제 값으로 채워져야 한다."""
+        from scanner.weinstein import analyze_stock
+
+        prices, volumes = _make_stage2_base(n_total=230, base_price=100.0)
+        prices[-1]  = 104.0
+        volumes[-1] = 6_000_000
+        df = _make_df(prices, volumes)
+
+        res = analyze_stock(df, "TEST", "테스트", "US")
+        assert res is not None
+        assert res["signal_type"] == "BREAKOUT"
+        # base_low ≈ 98 이므로 stop_loss ≈ 97 부근. price(=104) 미만 보장.
+        assert res["stop_loss"] is not None
+        assert res["stop_loss"] < res["price"]
+
+
+class TestRSZeroCross:
+    """detect_rs_zero_cross() — Mansfield RS 가 최근 N주에 음→양 전환했는지."""
+
+    def _stage_with_benchmark(self, neg_to_pos: bool = True, always_negative: bool = False,
+                              always_positive: bool = False):
+        """종목/벤치마크 시리즈 합성:
+          neg_to_pos: 초반 종목이 약하다가(음수 RS) 후반 강해짐(양수)
+          always_negative: 종목이 줄곧 약함
+          always_positive: 종목이 줄곧 강함
+        """
+        n = 320  # SMA52 (260일) + 60일 여유
+        idx = pd.date_range("2022-01-01", periods=n)
+
+        if always_negative:
+            stock = pd.Series([100.0 + i * 0.1 for i in range(n)], index=idx)
+            bench = pd.Series([100.0 + i * 0.5 for i in range(n)], index=idx)  # 더 빨리 상승
+        elif always_positive:
+            stock = pd.Series([100.0 + i * 0.5 for i in range(n)], index=idx)
+            bench = pd.Series([100.0 + i * 0.1 for i in range(n)], index=idx)
+        elif neg_to_pos:
+            # 처음 260일은 종목이 벤치보다 약하게(ratio < SMA), 이후 종목이 가파르게 상승
+            stock_vals = [100.0 + i * 0.1 for i in range(260)]
+            stock_vals += [stock_vals[-1] + (i + 1) * 1.5 for i in range(n - 260)]
+            bench_vals = [100.0 + i * 0.5 for i in range(n)]
+            stock = pd.Series(stock_vals, index=idx)
+            bench = pd.Series(bench_vals, index=idx)
+        return stock, bench
+
+    def test_zero_cross_within_window(self):
+        from scanner.weinstein import detect_rs_zero_cross
+        stock, bench = self._stage_with_benchmark(neg_to_pos=True)
+        assert detect_rs_zero_cross(stock, bench, lookback_weeks=8) is True
+
+    def test_always_negative_no_cross(self):
+        from scanner.weinstein import detect_rs_zero_cross
+        stock, bench = self._stage_with_benchmark(always_negative=True)
+        assert detect_rs_zero_cross(stock, bench, lookback_weeks=8) is False
+
+    def test_always_positive_no_cross(self):
+        from scanner.weinstein import detect_rs_zero_cross
+        stock, bench = self._stage_with_benchmark(always_positive=True)
+        # 줄곧 양수 — 음→양 전환 없음
+        assert detect_rs_zero_cross(stock, bench, lookback_weeks=8) is False
+
+    def test_benchmark_none_returns_false(self):
+        from scanner.weinstein import detect_rs_zero_cross
+        n = 300
+        idx = pd.date_range("2022-01-01", periods=n)
+        stock = pd.Series([100.0 + i * 0.1 for i in range(n)], index=idx)
+        assert detect_rs_zero_cross(stock, None, lookback_weeks=8) is False
+        assert detect_rs_zero_cross(None, stock, lookback_weeks=8) is False
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Strict Weinstein filter — Phase 1 scaffold
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1285,20 +1433,24 @@ class TestStrictFilterScaffold:
         assert "filter_reasons"       in res, "Phase 1 scaffold 누락: filter_reasons"
 
     def test_scaffold_default_values(self):
-        """Phase 1 단계에서는 stop_loss=None / strict_filter_passed=None / filter_reasons=[] 이 기본값."""
+        """strict_filter_passed / filter_reasons 의 Phase 1 기본값은 Phase 4 머지 전까지 유지.
+
+        stop_loss / rs_zero_crossed 는 Phase 2 부터 실제로 채워지므로 여기서는
+        '키 존재 + 타입 sane' 만 보장 (실제 값 검증은 TestStopLoss / TestRSZeroCross).
+        """
         from scanner.weinstein import analyze_stock
 
         df  = self._setup_breakout_df()
         res = analyze_stock(df, "TEST", "테스트", "US")
 
         assert res is not None
-        # Phase 2 가 stop_loss 채울 때까지 None
-        assert res["stop_loss"] is None
-        # Phase 4 의 scan_engine 이 채울 때까지 None
+        # Phase 4 의 scan_engine 이 채울 때까지 None — 이 invariant 가 핵심
         assert res["strict_filter_passed"] is None
-        # 거부 사유는 빈 리스트로 시작
+        # 거부 사유는 빈 리스트로 시작 (Phase 4 가 채움)
         assert res["filter_reasons"] == []
         assert isinstance(res["filter_reasons"], list)
+        # Phase 2 이후 stop_loss 는 None 또는 float
+        assert res["stop_loss"] is None or isinstance(res["stop_loss"], (int, float))
 
 
 # ── 실행 ──────────────────────────────────────────────────────────
