@@ -1091,23 +1091,13 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
 
     pct = (cur_p - cur_m150) / cur_m150 * 100 if cur_m150 else 0.0
 
-    # ── Mansfield RS (v4) + legacy ratio RS ──
-    # 표시용(rs_value/rs_trend/rs_legacy) 은 기존대로 *최신 bar* 기준.
-    # Strict gate 입력(rs_zero_crossed/stop_loss) 은 *signal 발생 시점* 까지로
-    # 슬라이스해서 no-look-ahead invariant 를 보존한다 (CLAUDE.md
-    # "Stage 2 candidates ... no look-ahead pivot").
-    rs_value, rs_trend = (None, None)
-    rs_legacy = None
-    rs_zero_crossed: Optional[bool] = None
-    if benchmark_close is not None:
-        rs_value, rs_trend = compute_relative_performance(
-            daily_ind["close"], benchmark_close, lookback_weeks=RS_LOOKBACK_WEEKS
-        )
-        rs_legacy = calc_rs(daily_ind["close"], benchmark_close)
-
-    # ── signal_date 시점까지의 데이터 슬라이스 (Phase 2 strict 입력용) ──
+    # ── signal_date 시점까지의 데이터 슬라이스 (Phase 2 — no-look-ahead) ──
     # detect_* 는 SCAN_LOOKBACK_DAYS 안의 *과거* bar 에서 신호를 잡을 수 있어
     # df.index[-1] 가 아닌 sig["signal_date"] 가 진짜 신호 시점이다.
+    # signal 은 시점 스냅샷이므로, RS / stop_loss / signal_quality / warning
+    # 모두 *signal 발생 시점* 의 시리즈로 산출해야 한다 (CLAUDE.md "Stage 2
+    # candidates ... no look-ahead pivot"). DB 에 기록되는 rs_value/rs_trend
+    # 도 이 신호의 RS 스냅샷이지, 스캔 직전 마지막 bar 의 RS 가 아니다.
     df_at_signal     = df.loc[: sig["signal_date"]]
     daily_at_signal  = daily_ind
     weekly_at_signal = weekly_ind
@@ -1124,9 +1114,17 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
     # signal 시점 close — stop_loss sanity 비교 (stop < price) 가 일관되도록.
     sig_close = float(df_at_signal["Close"].iloc[-1]) if len(df_at_signal) else cur_p
 
-    # Phase 2 — RS 0선 음→양 zero-cross (Strict Gate 6) — signal 시점까지의 시리즈만
+    # ── Mansfield RS (v4) + legacy ratio RS — signal 시점까지의 시리즈로 산출 ──
+    rs_value, rs_trend = (None, None)
+    rs_legacy = None
+    rs_zero_crossed: Optional[bool] = None
     if benchmark_close is not None:
         bench_at_signal = benchmark_close.loc[: sig["signal_date"]]
+        rs_value, rs_trend = compute_relative_performance(
+            daily_at_signal["close"], bench_at_signal, lookback_weeks=RS_LOOKBACK_WEEKS
+        )
+        rs_legacy = calc_rs(daily_at_signal["close"], bench_at_signal)
+        # Strict Gate 6 — RS 0선 음→양 zero-cross
         rs_zero_crossed = detect_rs_zero_cross(
             daily_at_signal["close"], bench_at_signal
         )

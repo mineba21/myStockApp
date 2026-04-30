@@ -1535,6 +1535,66 @@ class TestNoLookAhead:
             f"got={sl_call['price']}, expected={sig_close_expected}"
         )
 
+    def test_analyze_stock_rs_value_trend_at_signal_date(self):
+        """rs_value / rs_trend 도 signal 시점 시리즈로 산출되어야 한다.
+
+        Gate 6 (strict_filter._check_rs) 가 직접 읽는 필드가 rs_value /
+        rs_trend / rs_zero_crossed 셋이므로, rs_zero_crossed 만 슬라이스
+        해서는 부족하다. signal 발생 후 RS 가 음→양으로 개선된 합성
+        픽스처에서, analyze_stock 결과의 rs_value 가 *signal 시점*(음수)
+        기준이지 last bar(양수) 기준이 아닌지 검증.
+        """
+        from scanner.weinstein import analyze_stock, compute_relative_performance
+
+        # Mansfield RS 는 SMA52(주) ≈ 260 거래일 필요 → n_total≥280 보장.
+        # 5일 전 돌파, 그 이후 강세 지속.
+        prices, volumes = _make_stage2_base(n_total=300, base_price=100.0)
+        breakout_idx = len(prices) - 5
+        prices[breakout_idx]  = 104.0
+        volumes[breakout_idx] = 6_000_000
+        for i in range(breakout_idx + 1, len(prices)):
+            prices[i]  = 110.0
+            volumes[i] = 1_000_000
+        df = _make_df(prices, volumes)
+
+        # 벤치마크: signal 시점까지는 종목보다 *훨씬 강세* (ratio 가 SMA52
+        # 아래 → RS 음수), 마지막 5일에 급락 → ratio 가 SMA52 위로 점프
+        # → last bar 기준 RS 양수.
+        n = len(df)
+        bench_vals = [50.0 + i * 0.5 for i in range(n - 5)]            # 강한 상승
+        bench_vals += [bench_vals[-1] * (1.0 - 0.10 * (k + 1)) for k in range(5)]  # 급락
+        bench = pd.Series(bench_vals, index=df.index)
+
+        # 회귀 검증 조건: signal-시점 RS 와 last-bar RS 가 부호 반대인지 확인
+        sig_date_idx = df.index[breakout_idx]
+        rs_last_bar, _ = compute_relative_performance(df["Close"], bench)
+        rs_sig_view, _ = compute_relative_performance(
+            df["Close"].loc[:sig_date_idx], bench.loc[:sig_date_idx]
+        )
+        if rs_last_bar is None or rs_sig_view is None:
+            pytest.skip("RS 산출 불가 (벤치마크 길이 부족)")
+        if rs_sig_view >= 0 or rs_last_bar <= 0:
+            pytest.skip(
+                f"픽스처에서 RS 부호 반전 못 만듦 (sig={rs_sig_view}, last={rs_last_bar})"
+            )
+
+        res = analyze_stock(df, "TEST", "테스트", "US", benchmark_close=bench)
+        if res is None or res["signal_type"] != "BREAKOUT":
+            pytest.skip("BREAKOUT 시그널이 5일 전에 발생하지 않음 (픽스처 의존)")
+
+        # 결과 rs_value 는 signal 시점(음수) 이지 last bar(양수) 이면 안 됨
+        assert res["rs_value"] is not None
+        assert res["rs_value"] < 0, (
+            f"analyze_stock 가 last bar RS 를 기록함 (look-ahead). "
+            f"got rs_value={res['rs_value']}, sig_view={rs_sig_view}, "
+            f"last_view={rs_last_bar}"
+        )
+        # 부호만 검증 — 정확한 수치는 cur_ratio/cur_sma 계산 미세차로 변동 가능
+        assert abs(res["rs_value"] - rs_sig_view) < 0.5, (
+            f"rs_value 가 signal 시점 RS 와 일치하지 않음. "
+            f"got={res['rs_value']}, expected≈{rs_sig_view}"
+        )
+
     def test_rs_zero_cross_does_not_look_ahead(self):
         """RS 가 *signal 이후* 0선을 음→양 전환.
 
