@@ -1092,6 +1092,10 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
     pct = (cur_p - cur_m150) / cur_m150 * 100 if cur_m150 else 0.0
 
     # ── Mansfield RS (v4) + legacy ratio RS ──
+    # 표시용(rs_value/rs_trend/rs_legacy) 은 기존대로 *최신 bar* 기준.
+    # Strict gate 입력(rs_zero_crossed/stop_loss) 은 *signal 발생 시점* 까지로
+    # 슬라이스해서 no-look-ahead invariant 를 보존한다 (CLAUDE.md
+    # "Stage 2 candidates ... no look-ahead pivot").
     rs_value, rs_trend = (None, None)
     rs_legacy = None
     rs_zero_crossed: Optional[bool] = None
@@ -1100,19 +1104,43 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
             daily_ind["close"], benchmark_close, lookback_weeks=RS_LOOKBACK_WEEKS
         )
         rs_legacy = calc_rs(daily_ind["close"], benchmark_close)
-        # Phase 2 — RS 0선 음→양 zero-cross 감지 (Strict Gate 6)
-        rs_zero_crossed = detect_rs_zero_cross(daily_ind["close"], benchmark_close)
 
-    # ── Phase 2 — Strict Gate 8 손절가 계산 ──
+    # ── signal_date 시점까지의 데이터 슬라이스 (Phase 2 strict 입력용) ──
+    # detect_* 는 SCAN_LOOKBACK_DAYS 안의 *과거* bar 에서 신호를 잡을 수 있어
+    # df.index[-1] 가 아닌 sig["signal_date"] 가 진짜 신호 시점이다.
+    df_at_signal     = df.loc[: sig["signal_date"]]
+    daily_at_signal  = daily_ind
+    weekly_at_signal = weekly_ind
+    if len(df_at_signal) >= MA_PERIOD:
+        d_signal = _build_indicators(df_at_signal)
+        if d_signal is not None:
+            daily_at_signal = d_signal
+        w_signal_df = to_weekly_ohlcv(df_at_signal)
+        if len(w_signal_df) > 0:
+            w_signal = compute_weekly_indicators(w_signal_df)
+            if w_signal is not None:
+                weekly_at_signal = w_signal
+
+    # signal 시점 close — stop_loss sanity 비교 (stop < price) 가 일관되도록.
+    sig_close = float(df_at_signal["Close"].iloc[-1]) if len(df_at_signal) else cur_p
+
+    # Phase 2 — RS 0선 음→양 zero-cross (Strict Gate 6) — signal 시점까지의 시리즈만
+    if benchmark_close is not None:
+        bench_at_signal = benchmark_close.loc[: sig["signal_date"]]
+        rs_zero_crossed = detect_rs_zero_cross(
+            daily_at_signal["close"], bench_at_signal
+        )
+
+    # ── Phase 2 — Strict Gate 8 손절가 계산 (signal 시점 indicator 사용) ──
     stop_loss = compute_stop_loss(
         {
             "signal_type": sig["signal_type"],
-            "price":       cur_p,
+            "price":       sig_close,
             "pivot_price": sig.get("pivot_price"),
             "base_low":    sig.get("base_low"),
         },
-        daily_ind=daily_ind,
-        weekly_ind=weekly_ind,
+        daily_ind=daily_at_signal,
+        weekly_ind=weekly_at_signal,
     )
 
     # signal_quality 는 Mansfield RS (rs_value/rs_trend) 기준

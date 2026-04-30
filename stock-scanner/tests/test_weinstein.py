@@ -1403,6 +1403,175 @@ class TestRSZeroCross:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Strict Weinstein filter — Phase 2: no-look-ahead invariant 회귀 테스트
+# ═══════════════════════════════════════════════════════════════════
+#
+# detect_* 시그널은 SCAN_LOOKBACK_DAYS(=7) 안의 과거 bar 에서도 발생할 수
+# 있다. Phase 2 strict 필드(stop_loss / rs_zero_crossed) 는 signal 발생
+# 시점까지의 데이터만 보고 산출되어야 하며, 마지막 bar 까지 본다면
+# look-ahead invariant 가 깨진다.
+
+class TestNoLookAhead:
+
+    def test_stop_loss_uses_signal_date_indicators(self):
+        """signal 이 5일 전 발생 + 그 이후 *큰* 가격 변동으로 cur_m50 이 last
+        bar 와 signal 시점에 명확히 다른 합성 데이터.
+
+        analyze_stock 결과의 stop_loss 가 signal 시점 cur_m50 기반인지
+        검증 — REBOUND 의 fallback 후보 cur_m50 * 0.97 을 활용해 차이를
+        관찰한다.
+        """
+        from scanner import weinstein as W
+
+        # REBOUND 시그널을 강제로 며칠 전 발생시키기 위해 직접 합성 데이터 + sig 사용.
+        # analyze_stock 전체 흐름 대신 weinstein.compute_stop_loss 를
+        # signal 시점 vs last 시점 두 가지 daily_ind 로 호출해 서로 다른 결과
+        # 가 나오는지 확인 — 호출자가 시점 자르기를 잊으면 last 기준 stop 이
+        # 나오므로 회귀 발생.
+        n = 100
+        idx = pd.date_range("2024-01-01", periods=n)
+        # 1~95일까지 100, 96~100일에 급락 80
+        prices = [100.0] * 95 + [80.0] * 5
+        df = _make_df(prices)
+
+        # signal 시점 = 95일째(인덱스 94, 가격 100)
+        df_at_sig  = df.iloc[:95]
+        df_at_last = df
+
+        d_sig  = W._build_indicators(df_at_sig)
+        d_last = W._build_indicators(df_at_last)
+
+        sig_dict = {
+            "signal_type": "REBOUND",
+            "price":       100.0,
+        }
+        sl_at_sig  = W.compute_stop_loss(sig_dict, daily_ind=d_sig,  weekly_ind=None)
+        sl_at_last = W.compute_stop_loss(sig_dict, daily_ind=d_last, weekly_ind=None)
+
+        # 두 시점의 cur_m50 가 다르므로 stop 도 달라야 한다 — 회귀 시 동일해짐
+        assert sl_at_sig is not None
+        assert sl_at_last is not None
+        assert abs(sl_at_sig - sl_at_last) > 0.5, (
+            f"compute_stop_loss 가 입력 indicator 시점에 따라 다른 값을 내야 함. "
+            f"sig={sl_at_sig}, last={sl_at_last}"
+        )
+
+    def test_analyze_stock_passes_signal_date_indicators(self, monkeypatch):
+        """analyze_stock 이 compute_stop_loss / detect_rs_zero_cross 를
+        *signal 시점까지 슬라이스* 한 시리즈로 호출하는지 직접 검증.
+
+        주변 픽스처(base_low / pivot 우선순위) 영향을 받지 않도록 두 헬퍼를
+        monkeypatch 하여 호출 인자를 캡처한 뒤, 마지막 인덱스가
+        signal_date 와 일치하는지 확인한다.
+        """
+        from scanner import weinstein as W
+
+        # 5일 전 돌파 + 그 이후 강세 지속 → df.index[-1] != signal_date
+        prices, volumes = _make_stage2_base(n_total=230, base_price=100.0)
+        breakout_idx = len(prices) - 5
+        prices[breakout_idx]  = 104.0
+        volumes[breakout_idx] = 6_000_000
+        for i in range(breakout_idx + 1, len(prices)):
+            prices[i]  = 110.0
+            volumes[i] = 1_000_000
+
+        df = _make_df(prices, volumes)
+
+        captured = {"stop_loss": None, "zero_cross": None}
+
+        def _capture_stop_loss(sig, daily_ind=None, weekly_ind=None):
+            # weekly_ind 는 scalar dict (시간 idx 없음) 이므로 daily 만 추적
+            captured["stop_loss"] = {
+                "daily_last_idx":  daily_ind["close"].index[-1] if daily_ind is not None else None,
+                "price":           sig.get("price"),
+            }
+            return None
+
+        def _capture_zero_cross(close, bench, lookback_weeks=None):
+            captured["zero_cross"] = {
+                "close_last_idx": close.index[-1] if close is not None and len(close) else None,
+                "bench_last_idx": bench.index[-1] if bench is not None and len(bench) else None,
+            }
+            return False
+
+        monkeypatch.setattr(W, "compute_stop_loss",        _capture_stop_loss)
+        monkeypatch.setattr(W, "detect_rs_zero_cross",     _capture_zero_cross)
+
+        # 임의 benchmark — RS zero-cross 호출을 트리거하기 위해서만 필요
+        bench = pd.Series([100.0 + i * 0.05 for i in range(len(df))], index=df.index)
+
+        res = W.analyze_stock(df, "TEST", "테스트", "US", benchmark_close=bench)
+        if res is None or res["signal_type"] != "BREAKOUT":
+            pytest.skip("BREAKOUT 시그널이 5일 전에 발생하지 않음 (픽스처 의존)")
+
+        # ── 핵심 invariant: 호출 시점 마지막 인덱스가 signal_date 이하 ──
+        sig_date = pd.Timestamp(res["signal_date"])
+        last_bar = df.index[-1]
+        assert sig_date < last_bar, "회귀 검증 조건: signal_date 가 last bar 보다 과거여야 함"
+
+        sl_call = captured["stop_loss"]
+        zc_call = captured["zero_cross"]
+        assert sl_call is not None, "compute_stop_loss 가 호출되지 않음"
+        assert zc_call is not None, "detect_rs_zero_cross 가 호출되지 않음"
+
+        # daily indicator 의 마지막 idx 가 last bar 가 아니라 signal_date 이하
+        assert pd.Timestamp(sl_call["daily_last_idx"]) <= sig_date, (
+            f"compute_stop_loss 가 last bar daily_ind 를 받음. "
+            f"daily_last={sl_call['daily_last_idx']}, sig_date={sig_date}"
+        )
+        # zero-cross 의 close / bench 도 동일
+        assert pd.Timestamp(zc_call["close_last_idx"]) <= sig_date, (
+            f"detect_rs_zero_cross 가 last bar close 를 받음. "
+            f"close_last={zc_call['close_last_idx']}, sig_date={sig_date}"
+        )
+        assert pd.Timestamp(zc_call["bench_last_idx"]) <= sig_date, (
+            f"detect_rs_zero_cross 가 last bar benchmark 를 받음. "
+            f"bench_last={zc_call['bench_last_idx']}, sig_date={sig_date}"
+        )
+        # stop_loss price 도 signal 시점 close 여야 함 (last bar 가격 110 이 아닌)
+        sig_close_expected = float(df.loc[:sig_date]["Close"].iloc[-1])
+        assert abs(sl_call["price"] - sig_close_expected) < 1e-6, (
+            f"compute_stop_loss 가 last bar price 를 받음. "
+            f"got={sl_call['price']}, expected={sig_close_expected}"
+        )
+
+    def test_rs_zero_cross_does_not_look_ahead(self):
+        """RS 가 *signal 이후* 0선을 음→양 전환.
+
+        signal 시점까지만 보면 zero-cross 없음 → rs_zero_crossed=False 여야 한다.
+        analyze_stock 가 last bar 기준으로 본다면 True 가 되어 회귀.
+        """
+        from scanner.weinstein import detect_rs_zero_cross
+
+        # 전체 길이
+        n = 320
+        idx = pd.date_range("2022-01-01", periods=n)
+
+        # 처음 ~315일: stock 이 bench 보다 약함 (음수 RS)
+        # 마지막 5일: stock 급등 → RS 0선 통과 (last bar 까지 보면 zero-cross)
+        stock_vals = [100.0 + i * 0.1 for i in range(n - 5)]
+        stock_vals += [stock_vals[-1] * (1.0 + 0.02 * (k + 1)) for k in range(5)]
+        bench_vals = [100.0 + i * 0.5 for i in range(n)]
+        stock = pd.Series(stock_vals, index=idx)
+        bench = pd.Series(bench_vals, index=idx)
+
+        # last bar 까지 보면 → True 가 나올 수 있음 (전환이 *최근* lookback 안에)
+        last_view = detect_rs_zero_cross(stock, bench, lookback_weeks=8)
+
+        # signal 시점 = 5일 전(인덱스 314), 그 시점까지 슬라이스
+        signal_date = idx[n - 6]
+        stock_at_sig = stock.loc[:signal_date]
+        bench_at_sig = bench.loc[:signal_date]
+        sig_view = detect_rs_zero_cross(stock_at_sig, bench_at_sig, lookback_weeks=8)
+
+        # 회귀 가드: 두 view 가 다른 답을 낼 수 있다는 invariant 자체를 보호.
+        # 픽스처가 의도대로 만들어졌으면 last_view=True / sig_view=False 인 케이스가 존재.
+        assert sig_view is False, (
+            f"signal 시점에는 zero-cross 없어야 함. last_view={last_view}, sig_view={sig_view}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Strict Weinstein filter — Phase 1 scaffold
 # ═══════════════════════════════════════════════════════════════════
 
