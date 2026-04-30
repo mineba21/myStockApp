@@ -39,6 +39,14 @@ class ScanResult(Base):
     signal_quality   = Column(String(10),  nullable=True)   # STRONG/MODERATE/WEAK
     rs_value         = Column(Float,       nullable=True)   # Mansfield RS (v4)
     grade            = Column(String(5),   nullable=True)   # S/A/B 종합 등급
+    # ── Strict Weinstein filter (Phase 1 scaffold) ──────────────
+    stop_loss            = Column(Float,       nullable=True)              # Gate 8: BUY 시그널 손절가
+    sector_name          = Column(String(50),  nullable=True)              # Gate 2: 종목 sector (후속 plan)
+    sector_stage         = Column(String(10),  nullable=True)              # Gate 2: sector Stage1-4
+    rs_trend             = Column(String(10),  nullable=True)              # Gate 6: RISING/FALLING/FLAT
+    rs_zero_crossed      = Column(Boolean,     nullable=True)              # Gate 6: 최근 RS 0선 음→양 전환
+    strict_filter_passed = Column(Boolean,     nullable=True, index=True)  # 8 게이트 모두 통과
+    filter_reasons       = Column(Text,        nullable=True)              # 거부 사유 JSON 배열
 
 
 class ScanLog(Base):
@@ -204,18 +212,35 @@ def _migrate():
         # scan_results 테이블 — 새 메타데이터 컬럼
         sr_cols = _existing_cols("scan_results")
         for col, ddl in [
-            ("pivot_price",      "ALTER TABLE scan_results ADD COLUMN pivot_price REAL"),
-            ("support_level",    "ALTER TABLE scan_results ADD COLUMN support_level REAL"),
-            ("market_condition", "ALTER TABLE scan_results ADD COLUMN market_condition VARCHAR(20)"),
-            ("signal_quality",   "ALTER TABLE scan_results ADD COLUMN signal_quality VARCHAR(10)"),
-            ("rs_value",         "ALTER TABLE scan_results ADD COLUMN rs_value REAL"),
-            ("grade",            "ALTER TABLE scan_results ADD COLUMN grade VARCHAR(5)"),
+            ("pivot_price",          "ALTER TABLE scan_results ADD COLUMN pivot_price REAL"),
+            ("support_level",        "ALTER TABLE scan_results ADD COLUMN support_level REAL"),
+            ("market_condition",     "ALTER TABLE scan_results ADD COLUMN market_condition VARCHAR(20)"),
+            ("signal_quality",       "ALTER TABLE scan_results ADD COLUMN signal_quality VARCHAR(10)"),
+            ("rs_value",             "ALTER TABLE scan_results ADD COLUMN rs_value REAL"),
+            ("grade",                "ALTER TABLE scan_results ADD COLUMN grade VARCHAR(5)"),
+            # Strict Weinstein filter (Phase 1)
+            ("stop_loss",            "ALTER TABLE scan_results ADD COLUMN stop_loss REAL"),
+            ("sector_name",          "ALTER TABLE scan_results ADD COLUMN sector_name VARCHAR(50)"),
+            ("sector_stage",         "ALTER TABLE scan_results ADD COLUMN sector_stage VARCHAR(10)"),
+            ("rs_trend",             "ALTER TABLE scan_results ADD COLUMN rs_trend VARCHAR(10)"),
+            ("rs_zero_crossed",      "ALTER TABLE scan_results ADD COLUMN rs_zero_crossed BOOLEAN"),
+            ("strict_filter_passed", "ALTER TABLE scan_results ADD COLUMN strict_filter_passed BOOLEAN"),
+            ("filter_reasons",       "ALTER TABLE scan_results ADD COLUMN filter_reasons TEXT"),
         ]:
             if col not in sr_cols:
                 try:
                     conn.execute(_text(ddl)); conn.commit()
                 except Exception:
                     pass
+
+        # strict_filter_passed 인덱스 (자주 쓰는 필터)
+        try:
+            conn.execute(_text(
+                "CREATE INDEX IF NOT EXISTS ix_scan_results_strict_filter_passed "
+                "ON scan_results(strict_filter_passed)"
+            )); conn.commit()
+        except Exception:
+            pass
 
 
 def get_db():

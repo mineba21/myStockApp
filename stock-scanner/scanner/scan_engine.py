@@ -1,4 +1,5 @@
 """스캔 엔진 - 전체 스캔 오케스트레이션"""
+import json
 import logging
 from datetime import datetime
 from typing import Optional, Tuple
@@ -269,6 +270,16 @@ def _save(db, signal: dict):
         grade = _grade(signal)
         signal["_grade"] = grade  # notify에서 재사용
 
+        # filter_reasons 는 list → JSON 문자열로 직렬화 (없으면 None)
+        reasons = signal.get("filter_reasons")
+        if reasons is None or reasons == []:
+            reasons_json = None
+        else:
+            try:
+                reasons_json = json.dumps(reasons)
+            except Exception:
+                reasons_json = None
+
         if existing:
             # 최신 가격/품질만 업데이트
             existing.price            = signal["price"]
@@ -281,6 +292,14 @@ def _save(db, signal: dict):
             existing.rs_value         = signal.get("rs_value")
             existing.grade            = grade
             existing.scan_time        = datetime.utcnow()
+            # Strict Weinstein filter (Phase 1 scaffold; Phase 4 에서 채워짐)
+            existing.stop_loss            = signal.get("stop_loss")
+            existing.sector_name          = signal.get("sector_name")
+            existing.sector_stage         = signal.get("sector_stage")
+            existing.rs_trend             = signal.get("rs_trend")
+            existing.rs_zero_crossed      = signal.get("rs_zero_crossed")
+            existing.strict_filter_passed = signal.get("strict_filter_passed")
+            existing.filter_reasons       = reasons_json
         else:
             db.add(ScanResult(
                 scan_time        = datetime.utcnow(),
@@ -301,6 +320,14 @@ def _save(db, signal: dict):
                 signal_quality   = signal.get("signal_quality"),
                 rs_value         = signal.get("rs_value"),
                 grade            = grade,
+                # Strict Weinstein filter (Phase 1 scaffold; Phase 4 에서 채워짐)
+                stop_loss            = signal.get("stop_loss"),
+                sector_name          = signal.get("sector_name"),
+                sector_stage         = signal.get("sector_stage"),
+                rs_trend             = signal.get("rs_trend"),
+                rs_zero_crossed      = signal.get("rs_zero_crossed"),
+                strict_filter_passed = signal.get("strict_filter_passed"),
+                filter_reasons       = reasons_json,
             ))
         db.commit()
     except Exception as e:

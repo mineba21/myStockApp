@@ -1254,6 +1254,53 @@ class TestSignalQualityMansfield:
             assert res["rs_passed"] is False
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Strict Weinstein filter — Phase 1 scaffold
+# ═══════════════════════════════════════════════════════════════════
+
+class TestStrictFilterScaffold:
+    """Phase 1: analyze_stock 결과 dict 에 strict-filter 스캐폴드 키가 존재하는지 확인.
+
+    실제 게이트 로직은 Phase 2~4 에서 채워지므로 여기서는 *키 존재* 와
+    *기본값* 만 검증한다. 동작 변화는 없어야 한다(no-op).
+    """
+
+    def _setup_breakout_df(self):
+        """기존 v4 BREAKOUT 픽스처와 동일한 구조 — Stage2 + 거래량 spike."""
+        prices, volumes = _make_stage2_base(n_total=230, base_price=100.0)
+        prices[-1]  = 104.0
+        volumes[-1] = 6_000_000
+        return _make_df(prices, volumes)
+
+    def test_scaffold_keys_exist_on_breakout(self):
+        """analyze_stock 출력에 stop_loss / strict_filter_passed / filter_reasons 가 있어야 함."""
+        from scanner.weinstein import analyze_stock
+
+        df  = self._setup_breakout_df()
+        res = analyze_stock(df, "TEST", "테스트", "US")
+
+        assert res is not None
+        assert "stop_loss"            in res, "Phase 1 scaffold 누락: stop_loss"
+        assert "strict_filter_passed" in res, "Phase 1 scaffold 누락: strict_filter_passed"
+        assert "filter_reasons"       in res, "Phase 1 scaffold 누락: filter_reasons"
+
+    def test_scaffold_default_values(self):
+        """Phase 1 단계에서는 stop_loss=None / strict_filter_passed=None / filter_reasons=[] 이 기본값."""
+        from scanner.weinstein import analyze_stock
+
+        df  = self._setup_breakout_df()
+        res = analyze_stock(df, "TEST", "테스트", "US")
+
+        assert res is not None
+        # Phase 2 가 stop_loss 채울 때까지 None
+        assert res["stop_loss"] is None
+        # Phase 4 의 scan_engine 이 채울 때까지 None
+        assert res["strict_filter_passed"] is None
+        # 거부 사유는 빈 리스트로 시작
+        assert res["filter_reasons"] == []
+        assert isinstance(res["filter_reasons"], list)
+
+
 # ── 실행 ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import subprocess

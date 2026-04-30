@@ -1003,6 +1003,13 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
         "signal_quality":  qual,
         "rs_passed":       (rs_value is not None and rs_value >= 0.0),
         "warning_flags":   warning_flags,
+        # ── Strict Weinstein filter (Phase 1 scaffold; 후속 phase 에서 채워짐) ──
+        # stop_loss            : Phase 2 — compute_stop_loss() 로 계산
+        # strict_filter_passed : Phase 4 — scan_engine 에서 apply_strict_filter() 결과로 채움
+        # filter_reasons       : Phase 4 — 거부 사유 enum 문자열 리스트
+        "stop_loss":            None,
+        "strict_filter_passed": None,
+        "filter_reasons":       [],
     }
     if weekly_ind is not None:
         result["sma30w"] = round(weekly_ind["cur_sma30w"], 4)

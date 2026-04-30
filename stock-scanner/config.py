@@ -62,6 +62,39 @@ RS_LOOKBACK_WEEKS    = int(os.getenv("RS_LOOKBACK_WEEKS",    "52"))  # Mansfield
 BASE_MIN_WEEKS       = int(os.getenv("BASE_MIN_WEEKS",       "5"))   # 최소 base 기간 (주)
 PIVOT_LOOKBACK_WEEKS = int(os.getenv("PIVOT_LOOKBACK_WEEKS", "26"))  # pivot 탐색 최대 기간
 
+# ── Strict Weinstein Optimal Buy Filter ────────────────────────
+# CLAUDE.md 8개 mandatory gate를 hard-block 으로 강제. 실패 사유는
+# `filter_reasons` 로 추적되며, 실패 게이트는 `warning_flags` 로 강등되지 않는다.
+# 자세한 내용: docs/plans/strict-weinstein-optimal-buy-filter.md
+STRICT_WEINSTEIN_MODE                       = os.getenv("STRICT_WEINSTEIN_MODE", "true").lower() == "true"
+
+# Gate 1 — Market
+STRICT_REQUIRE_MARKET_CONFIRMATION          = os.getenv("STRICT_REQUIRE_MARKET_CONFIRMATION", "true").lower() == "true"
+STRICT_BLOCK_CAUTION_BREAKOUTS              = os.getenv("STRICT_BLOCK_CAUTION_BREAKOUTS", "true").lower() == "true"
+
+# Gate 2 — Sector (스텁; 종목당 sector 매핑은 후속 plan)
+STRICT_REQUIRE_SECTOR_STAGE2                = os.getenv("STRICT_REQUIRE_SECTOR_STAGE2", "false").lower() == "true"
+
+# Gate 3 — Stock Weekly/Daily Stage
+STRICT_REQUIRE_PRICE_ABOVE_WEEKLY_30MA      = os.getenv("STRICT_REQUIRE_PRICE_ABOVE_WEEKLY_30MA", "true").lower() == "true"
+STRICT_REQUIRE_PRICE_ABOVE_DAILY_150MA      = os.getenv("STRICT_REQUIRE_PRICE_ABOVE_DAILY_150MA", "true").lower() == "true"
+
+# Gate 5 — Breakout Volume
+STRICT_REQUIRE_BREAKOUT_VOLUME              = os.getenv("STRICT_REQUIRE_BREAKOUT_VOLUME", "true").lower() == "true"
+
+# Gate 6 — Mansfield RS
+STRICT_REQUIRE_RS_POSITIVE                  = os.getenv("STRICT_REQUIRE_RS_POSITIVE", "true").lower() == "true"
+STRICT_REQUIRE_RS_RISING                    = os.getenv("STRICT_REQUIRE_RS_RISING", "true").lower() == "true"
+STRICT_REQUIRE_RS_ZERO_CROSS_FOR_BREAKOUT   = os.getenv("STRICT_REQUIRE_RS_ZERO_CROSS_FOR_BREAKOUT", "true").lower() == "true"
+RS_ZERO_CROSS_LOOKBACK_WEEKS                = int(os.getenv("RS_ZERO_CROSS_LOOKBACK_WEEKS", "8"))
+
+# Gate 8 — Stop-loss
+STRICT_REQUIRE_STOP_LOSS                    = os.getenv("STRICT_REQUIRE_STOP_LOSS", "true").lower() == "true"
+
+# Persistence / Notification (debug & opt-in)
+STRICT_PERSIST_REJECTED                     = os.getenv("STRICT_PERSIST_REJECTED", "false").lower() == "true"
+STRICT_NOTIFY_INCLUDE_REASONS               = os.getenv("STRICT_NOTIFY_INCLUDE_REASONS", "false").lower() == "true"
+
 # ── Schedule / Infra ────────────────────────────────────────────
 SCHEDULE_TIMES = os.getenv("SCHEDULE_TIMES", "09:00,14:00,22:00").split(",")
 
