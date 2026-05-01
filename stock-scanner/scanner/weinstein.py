@@ -1173,6 +1173,12 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
         "pivot_price":     sig.get("pivot_price"),
         "support_level":   sig.get("support_level"),
         "base_quality":    sig.get("base_quality", "N/A"),
+        # Phase 3 — Strict Gate 4 (Base) 입력. sig dict 의 signal-time 값을 그대로 노출.
+        # base_low / base_weeks / base_quality_v4 는 BREAKOUT 만, v4_gate 는 REBOUND 만 가짐.
+        "base_low":        sig.get("base_low"),
+        "base_weeks":      sig.get("base_weeks"),
+        "base_quality_v4": sig.get("base_quality_v4"),
+        "v4_gate":         sig.get("v4_gate"),
         "market_condition": market_condition,
         "signal_quality":  qual,
         "rs_passed":       (rs_value is not None and rs_value >= 0.0),
@@ -1191,6 +1197,8 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
         result["sma30w"] = round(weekly_ind["cur_sma30w"], 4)
         result["sma10w"] = round(weekly_ind["cur_sma10w"], 4)
         result["weekly_volume_ratio"] = weekly_ind.get("weekly_volume_ratio")
+        # Phase 3 — Strict Gate 3 (Weekly Stage) 가 STAGE2 + slope ≤ 0 차단
+        result["slope30w"] = round(weekly_ind["slope30w"], 6)
     return result
 
 
