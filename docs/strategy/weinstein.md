@@ -30,8 +30,14 @@
 
 ## 4. 거래량
 
-- 돌파일 거래량은 직전 평균(주봉 또는 일봉) 대비 의미 있게 커야 한다(가능하면 ≥2x).
-- 거래량 미달이면 fakeout 위험으로 신호 강도를 낮추거나 차단한다.
+- 돌파일 거래량은 직전 평균(주봉 또는 일봉) 대비 의미 있게 커야 한다.
+- 구현상 임계값(`config.py`):
+  - 일봉 ≥ `BREAKOUT_DAILY_VOL_RATIO` (기본 3.0x)
+  - 주봉 ≥ `BREAKOUT_WEEKLY_VOL_RATIO` (기본 2.0x)
+- **Strict 모드에서 거래량 미달은 hard-block** — `weinstein.detect_stage2_breakout`
+  가 시그널 자체를 발생시키지 않으며, 추가로 `strict_filter` Gate 5
+  (`breakout_daily_volume` / `breakout_weekly_volume`)가 sanity 재검증한다.
+  신호 강도 강등(warning_flag) 으로 우회되지 않는다.
 
 ## 5. 상대강도(Mansfield RS)
 
@@ -50,6 +56,12 @@
 - 시장이 STAGE4 + BEAR이면 신규 매수 시그널 발생 안 함.
 - 종목이 STAGE3/STAGE4면 BREAKOUT/RE_BREAKOUT 무효.
 - 과매수(예: 30주 MA 대비 과도한 이격) 시 신호 강도 하향.
+
+`STRICT_WEINSTEIN_MODE=True` (기본) 에서는 위 차단 규칙이 8개 게이트로
+강화되어 hard-block 으로 작동한다. 거부 사유는 `scan_results.filter_reasons`
+(JSON) 으로 추적되며, 실패 게이트는 절대 `warning_flags` 로 강등되지 않는다.
+세부: `docs/plans/strict-weinstein-optimal-buy-filter.md`,
+`scanner/strict_filter.py`.
 
 ## 8. 매도 시그널
 

@@ -566,3 +566,281 @@ class TestSavePersistsStrictFields:
             assert not missing, f"_migrate() 가 추가 못한 컬럼: {missing}"
         finally:
             _os.unlink(tmp.name)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Strict Weinstein filter — Phase 4: scan_engine flow integration
+# ══════════════════════════════════════════════════════════════════
+
+def _force_scan_engine_flag(monkeypatch, name: str, value):
+    """scan_engine 가 import 시 캡처한 단일 STRICT_* 플래그 강제."""
+    import config as _config
+    monkeypatch.setattr(_config, name, value, raising=False)
+    # _process_signal / _evaluate_strict_filter / _notify 는 매 호출마다
+    # config 에서 다시 import 하므로 모듈 재로드는 불필요.
+
+
+def _force_strict_module_flag(monkeypatch, name: str, value):
+    """strict_filter 모듈이 import 시 캡처한 STRICT_* 플래그 강제."""
+    from scanner import strict_filter
+    monkeypatch.setattr(strict_filter, name, value, raising=False)
+
+
+class TestStrictFilterFlow:
+    """Phase 4 — analyze_stock → apply_strict_filter → _save / _notify 통합 흐름.
+
+    - STRICT_WEINSTEIN_MODE=True 가 기본값. strict-pass 만 _save / notify.
+    - STRICT_PERSIST_REJECTED=True 일 때 거부 시그널도 _save 되지만 notify 미포함.
+    - STRICT_WEINSTEIN_MODE=False 면 legacy 호환 — 모든 시그널 _save / notify.
+    """
+
+    def _fresh_db(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from database.models import Base
+
+        eng = create_engine("sqlite:///:memory:",
+                            connect_args={"check_same_thread": False})
+        Base.metadata.create_all(eng)
+        Session = sessionmaker(bind=eng)
+        return Session()
+
+    def _passing_signal(self, **overrides):
+        """8 게이트 모두 통과하는 baseline BREAKOUT analyze_stock 결과 dict."""
+        sig = {
+            # display/persist 공개 필드
+            "ticker":           "STR",
+            "name":             "Strict",
+            "market":           "US",
+            "signal_type":      "BREAKOUT",
+            "stage":            "STAGE2",
+            "weekly_stage":     "STAGE2",
+            "price":            110.0,
+            "ma150":            100.0,
+            "ma50":              98.0,
+            "price_vs_ma_pct":  10.0,
+            "ma_slope":          0.5,
+            "volume":           5_000_000,
+            "volume_avg":       1_000_000,
+            "volume_ratio":      5.0,
+            "weekly_volume_ratio": 2.5,
+            "sma30w":            95.0,
+            "slope30w":           0.5,
+            "signal_date":     "2024-07-01",
+            "rs":                1.4,
+            "rs_value":          4.5,
+            "rs_trend":         "RISING",
+            "rs_zero_crossed":  True,
+            "pivot_price":     105.0,
+            "support_level":   100.0,
+            "base_low":         95.0,
+            "base_weeks":        8.0,
+            "base_quality":   "STRONG",
+            "base_quality_v4":"TIGHT",
+            "v4_gate":          None,
+            "market_condition": "BULL",
+            "signal_quality":  "STRONG",
+            "rs_passed":        True,
+            "warning_flags":     [],
+            "stop_loss":         94.0,
+            "strict_filter_passed": None,    # _evaluate_strict_filter 가 채움
+            "filter_reasons":      [],
+            # strict_* signal-date 스냅샷
+            "strict_price":             110.0,
+            "strict_ma150":             100.0,
+            "strict_ma50":               98.0,
+            "strict_weekly_stage":   "STAGE2",
+            "strict_sma30w":             95.0,
+            "strict_slope30w":            0.5,
+            "strict_weekly_volume_ratio": 2.5,
+        }
+        sig.update(overrides)
+        return sig
+
+    def _force_strict_baseline(self, monkeypatch, *, mode=True, persist=False):
+        """Phase 4 통합 테스트 — 14 STRICT_* 와 strict_filter 모듈 플래그 동시 강제."""
+        # config 모듈 (scan_engine 이 매 호출마다 import)
+        _force_scan_engine_flag(monkeypatch, "STRICT_WEINSTEIN_MODE",      mode)
+        _force_scan_engine_flag(monkeypatch, "STRICT_PERSIST_REJECTED",    persist)
+        _force_scan_engine_flag(monkeypatch, "STRICT_NOTIFY_INCLUDE_REASONS", False)
+        # strict_filter 모듈 (import 시 캡처 후 매 호출마다 read)
+        for name, value in (
+            ("STRICT_WEINSTEIN_MODE",                       mode),
+            ("STRICT_REQUIRE_MARKET_CONFIRMATION",          True),
+            ("STRICT_BLOCK_CAUTION_BREAKOUTS",              True),
+            ("STRICT_REQUIRE_SECTOR_STAGE2",                False),
+            ("STRICT_REQUIRE_PRICE_ABOVE_WEEKLY_30MA",      True),
+            ("STRICT_REQUIRE_PRICE_ABOVE_DAILY_150MA",      True),
+            ("STRICT_REQUIRE_BREAKOUT_VOLUME",              True),
+            ("STRICT_REQUIRE_RS_POSITIVE",                  True),
+            ("STRICT_REQUIRE_RS_RISING",                    True),
+            ("STRICT_REQUIRE_RS_ZERO_CROSS_FOR_BREAKOUT",   True),
+            ("STRICT_REQUIRE_STOP_LOSS",                    True),
+        ):
+            _force_strict_module_flag(monkeypatch, name, value)
+
+    def test_strict_pass_saves_and_notifies(self, monkeypatch):
+        """STRICT_WEINSTEIN_MODE=True + 모든 게이트 통과 → _save 호출, notify 리스트 포함."""
+        from scanner.scan_engine import _process_signal
+        from database.models import ScanResult
+
+        self._force_strict_baseline(monkeypatch, mode=True, persist=False)
+
+        db  = self._fresh_db()
+        sig = self._passing_signal()
+        try:
+            notified = _process_signal(db, sig, "US",
+                                       market_condition="BULL",
+                                       benchmark_close=object())
+            # notify 대상으로 인정
+            assert notified is True
+            # DB 영속화 확인 + strict_filter_passed=True
+            row = db.query(ScanResult).filter(ScanResult.ticker == "STR").one()
+            assert row.strict_filter_passed is True
+            assert row.filter_reasons       is None       # [] → NULL 정규화
+            assert sig["strict_filter_passed"] is True
+            assert sig["filter_reasons"]      == []
+        finally:
+            db.close()
+
+    def test_strict_reject_drops_signal_in_strict_mode(self, monkeypatch):
+        """STRICT_WEINSTEIN_MODE=True + RS 음수 → _save 미호출, notify 미포함."""
+        from scanner.scan_engine import _process_signal
+        from database.models import ScanResult
+
+        self._force_strict_baseline(monkeypatch, mode=True, persist=False)
+
+        db  = self._fresh_db()
+        sig = self._passing_signal(rs_value=-2.0)   # Gate 6 fail
+        try:
+            notified = _process_signal(db, sig, "US",
+                                       market_condition="BULL",
+                                       benchmark_close=object())
+            assert notified is False
+            # DB 미저장 (STRICT_PERSIST_REJECTED=False)
+            assert db.query(ScanResult).count() == 0
+            # 거부 메타는 dict 에 남아 있어야 — 디버그 경로
+            assert sig["strict_filter_passed"] is False
+            assert "rs_below_zero" in sig["filter_reasons"]
+        finally:
+            db.close()
+
+    def test_persist_rejected_saves_but_does_not_notify(self, monkeypatch):
+        """STRICT_PERSIST_REJECTED=True → 거부 시그널도 DB 저장, 그러나 notify 미포함."""
+        from scanner.scan_engine import _process_signal
+        from database.models import ScanResult
+
+        self._force_strict_baseline(monkeypatch, mode=True, persist=True)
+
+        db  = self._fresh_db()
+        sig = self._passing_signal(rs_value=-2.0, rs_trend="FALLING")
+        try:
+            notified = _process_signal(db, sig, "US",
+                                       market_condition="BULL",
+                                       benchmark_close=object())
+            # notify 미포함 (debug-only persistence)
+            assert notified is False
+            # DB 에는 거부 시그널이 영속화 — strict_filter_passed=False, reasons JSON
+            row = db.query(ScanResult).filter(ScanResult.ticker == "STR").one()
+            assert row.strict_filter_passed is False
+            decoded = json.loads(row.filter_reasons)
+            assert "rs_below_zero" in decoded
+            assert "rs_falling"    in decoded
+        finally:
+            db.close()
+
+    def test_legacy_mode_off_saves_and_notifies_all(self, monkeypatch):
+        """STRICT_WEINSTEIN_MODE=False → 모든 시그널 _save / notify (legacy 호환)."""
+        from scanner.scan_engine import _process_signal
+        from database.models import ScanResult
+
+        self._force_strict_baseline(monkeypatch, mode=False, persist=False)
+
+        db  = self._fresh_db()
+        # 거부될 만한 시그널이라도 (rs 음수, stop None) legacy 모드에선 통과
+        sig = self._passing_signal(rs_value=-2.0, rs_trend="FALLING",
+                                   stop_loss=None)
+        try:
+            notified = _process_signal(db, sig, "US",
+                                       market_condition="BULL",
+                                       benchmark_close=object())
+            assert notified is True
+            # _save 호출됨
+            row = db.query(ScanResult).filter(ScanResult.ticker == "STR").one()
+            # apply_strict_filter 가 (True, []) 우회 반환 → strict_filter_passed=True
+            assert row.strict_filter_passed is True
+            assert row.filter_reasons       is None
+        finally:
+            db.close()
+
+    def test_filter_reasons_serialized_to_json_on_reject_persist(self, monkeypatch):
+        """거부 시그널의 filter_reasons 가 JSON 으로 라운드트립되는지 확인.
+
+        plan 의 reason enum 안정성 보증 — DB 에 저장된 문자열을 다시 파싱해
+        list[str] 로 복원되어야 BI/대시보드/regression 추적이 가능.
+        """
+        from scanner.scan_engine import _process_signal
+        from database.models import ScanResult
+
+        self._force_strict_baseline(monkeypatch, mode=True, persist=True)
+
+        db  = self._fresh_db()
+        # 여러 게이트 동시 실패 — RS 음수 + 거래량 부족 + stop 없음
+        sig = self._passing_signal(rs_value=-3.0, volume_ratio=0.5,
+                                   stop_loss=None)
+        try:
+            _process_signal(db, sig, "US",
+                            market_condition="BULL",
+                            benchmark_close=object())
+            row = db.query(ScanResult).filter(ScanResult.ticker == "STR").one()
+            assert row.filter_reasons is not None
+            decoded = json.loads(row.filter_reasons)
+            assert isinstance(decoded, list)
+            # 정확한 enum 문자열로 직렬화 — strict_filter 의 reason 상수와 일치
+            assert "rs_below_zero"         in decoded
+            assert "breakout_daily_volume" in decoded
+            assert "stop_loss_missing"     in decoded
+        finally:
+            db.close()
+
+    def test_bear_market_blocks_in_strict_mode(self, monkeypatch):
+        """legacy BEAR fast-path + strict Gate 1 둘 다 BEAR 시그널을 차단.
+
+        BEAR 차단은 두 경로 모두에서 사라지면 안 되는 invariant.
+        STRICT_PERSIST_REJECTED=False 인 일반 운영에서는 BEAR fast-path 가
+        먼저 발동하므로 strict 평가까지 가지 않고 즉시 drop.
+        """
+        from scanner.scan_engine import _process_signal
+        from database.models import ScanResult
+
+        self._force_strict_baseline(monkeypatch, mode=True, persist=False)
+
+        db  = self._fresh_db()
+        sig = self._passing_signal()
+        try:
+            notified = _process_signal(db, sig, "US",
+                                       market_condition="BEAR",
+                                       benchmark_close=object())
+            assert notified is False
+            assert db.query(ScanResult).count() == 0
+        finally:
+            db.close()
+
+    def test_notify_filter_reasons_opt_in_renders_pass_badge(self, monkeypatch):
+        """STRICT_NOTIFY_INCLUDE_REASONS=True 일 때 strict-pass 배지가 알림에 포함."""
+        from scanner.scan_engine import _notify
+
+        _force_scan_engine_flag(monkeypatch, "STRICT_NOTIFY_INCLUDE_REASONS", True)
+        _force_scan_engine_flag(monkeypatch, "STRICT_WEINSTEIN_MODE",         True)
+
+        captured = {}
+        def fake_send(text):
+            captured["text"] = text
+
+        sig = self._passing_signal()
+        sig["strict_filter_passed"] = True
+        sig["filter_reasons"]       = []
+        sig["_grade"]               = "A"
+
+        _notify([sig], [], fake_send)
+        assert "🛡 strict-pass" in captured.get("text", "")

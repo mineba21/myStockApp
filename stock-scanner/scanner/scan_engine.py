@@ -6,6 +6,39 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+# ── Strict Weinstein 필터 통합 ────────────────────────────────────
+# Phase 4 — analyze_stock 결과 dict 에 ``apply_strict_filter`` 의
+# (passed, reasons) 결과를 채우고, ``STRICT_WEINSTEIN_MODE=True`` 면
+# strict-pass 만 _save / notify 로 전파한다.
+#
+# - STRICT_PERSIST_REJECTED=True 토글 시 거부 시그널도 DB 에 영속화 →
+#   백테스트/QA 데이터 확보. 알림은 *모든* 모드에서 strict-pass 만 발송.
+# - STRICT_NOTIFY_INCLUDE_REASONS=True 토글 시 알림에 거부 사유 표시
+#   (그 자체는 strict-pass 시그널이라 normally 빈 리스트지만 legacy 모드
+#    에서는 모든 시그널이 통과 표기되므로 무의미; 디버그 도움용).
+
+def _evaluate_strict_filter(signal: dict,
+                            market_condition: Optional[str],
+                            benchmark_close) -> Tuple[bool, list]:
+    """analyze_stock 결과에 strict 필터를 적용하고 (passed, reasons) 를 반환.
+
+    signal dict 에 ``strict_filter_passed`` / ``filter_reasons`` 도 in-place
+    로 기록하여 _save() / _notify() 가 그 값을 그대로 영속/표시할 수 있게 한다.
+    Phase 5 의 sector 매핑이 들어오기 전까지는 sector_stage 는 항상 None.
+    """
+    from scanner.strict_filter import apply_strict_filter
+
+    ctx = {
+        "market_condition":  market_condition,
+        "sector_stage":      None,                          # Phase 5 까지 None
+        "benchmark_present": benchmark_close is not None,
+    }
+    passed, reasons = apply_strict_filter(signal, ctx)
+    signal["strict_filter_passed"] = passed
+    signal["filter_reasons"]       = reasons
+    return passed, reasons
+
 scan_status = {
     "is_running": False, "market": "",
     "progress": 0, "total": 0,
@@ -166,6 +199,59 @@ def run_scan(market: str = "ALL", universe: str = None,
         db.close()
 
 
+def _process_signal(db, res: dict, market_label: str,
+                    market_condition: Optional[str],
+                    benchmark_close) -> bool:
+    """analyze_stock 결과를 받아 legacy 시장 필터 + strict 필터 + persist/notify
+    분기를 한 곳에서 처리하고, 알림 대상이면 True 를 반환.
+
+    흐름:
+      1. legacy ``_get_market_filter_decision`` (CAUTION 표기 + BEAR fast-path).
+         BEAR fast-path 는 STRICT_PERSIST_REJECTED 일 때만 strict 평가까지
+         넘기고, 그 외 모드에서는 비용 절약 차원에서 즉시 drop.
+      2. ``apply_strict_filter`` 평가 → signal dict 에 strict_filter_passed /
+         filter_reasons 기록.
+      3. STRICT_WEINSTEIN_MODE=True 면 strict-pass 만 _save / notify.
+         False 면 legacy 호환 — 모두 _save / notify (단, market filter 로
+         이미 차단된 BEAR 시그널은 여전히 drop).
+      4. STRICT_PERSIST_REJECTED=True 면 거부 시그널도 _save 하되 notify
+         리스트에는 포함하지 않음 (debug-only).
+    """
+    from config import STRICT_WEINSTEIN_MODE, STRICT_PERSIST_REJECTED
+
+    ticker = res["ticker"]
+
+    # 1) legacy market filter — CAUTION 표시용. BEAR fast-path 는 비용 절약.
+    allow, flag = _get_market_filter_decision(market_condition, res["signal_type"])
+    if not allow and not STRICT_PERSIST_REJECTED:
+        logger.debug(f"[{market_label}] {ticker} legacy market filter: {flag}")
+        return False
+    if flag:
+        res["_market_flag"] = flag
+
+    # 2) strict 필터 평가 (STRICT_WEINSTEIN_MODE=False 면 항상 (True, []) 반환)
+    passed, reasons = _evaluate_strict_filter(res, market_condition, benchmark_close)
+
+    # 3) persist/notify 분기
+    if passed:
+        _save(db, res)
+        logger.info(f"[{market_label}] {ticker} {res['name']}: "
+                    f"{res['signal_type']} Q={res.get('signal_quality','?')} "
+                    f"strict=PASS")
+        return True
+
+    # 거부 — strict 모드 ON
+    if STRICT_WEINSTEIN_MODE:
+        if STRICT_PERSIST_REJECTED:
+            _save(db, res)
+        logger.debug(f"[{market_label}] {ticker} strict reject: {reasons}")
+        return False
+
+    # STRICT_WEINSTEIN_MODE=False (legacy 호환) — 통과 처리
+    _save(db, res)
+    return True
+
+
 def _scan_kr(db, benchmark_close=None, market_condition=None, kr_universe="kospi+kosdaq"):
     from scanner.kr_stocks import get_all_kr_tickers, get_kr_ohlcv
     from scanner.weinstein import analyze_stock
@@ -182,17 +268,9 @@ def _scan_kr(db, benchmark_close=None, market_condition=None, kr_universe="kospi
         res = analyze_stock(df, info["ticker"], info["name"], "KR",
                             benchmark_close, market_condition)
         count += 1
-        if res:
-            allow, flag = _get_market_filter_decision(market_condition, res["signal_type"])
-            if not allow:
-                logger.debug(f"[KR] {info['ticker']} 필터됨: {flag}")
-                continue
-            if flag:
-                res["_market_flag"] = flag
-            _save(db, res)
+        if res and _process_signal(db, res, "KR",
+                                   market_condition, benchmark_close):
             signals.append(res)
-            logger.info(f"[KR] {info['ticker']} {info['name']}: {res['signal_type']} "
-                        f"Q={res.get('signal_quality','?')}")
         time.sleep(0.05)
 
     return signals, count
@@ -212,14 +290,8 @@ def _scan_us(db, universe, benchmark_close=None, market_condition=None):
         res = analyze_stock(df, info["ticker"], info["name"], "US",
                             benchmark_close, market_condition)
         count += 1
-        if res:
-            allow, flag = _get_market_filter_decision(market_condition, res["signal_type"])
-            if not allow:
-                logger.debug(f"[US] {info['ticker']} 필터됨: {flag}")
-                continue
-            if flag:
-                res["_market_flag"] = flag
-            _save(db, res)
+        if res and _process_signal(db, res, "US",
+                                   market_condition, benchmark_close):
             signals.append(res)
 
     return signals, count
@@ -355,6 +427,23 @@ def _sector_summary(market: str) -> str:
 
 
 def _notify(buys, sells, send_fn):
+    """매수/매도 시그널을 Telegram 메시지로 포맷.
+
+    Phase 4 invariant: ``buys`` 는 *strict-pass* 만 들어오므로 본 함수는
+    별도의 strict 거부 분기 없이 순수 포맷팅만 담당. 거부 시그널의
+    DB persistence 는 ``_process_signal`` 에서 STRICT_PERSIST_REJECTED 토글
+    하에 처리된다.
+
+    ``STRICT_NOTIFY_INCLUDE_REASONS=True`` 토글 시 strict 결과 메타(통과 표시
+    + 비어있지 않은 reason 리스트) 가 알림에 추가된다. 기본 False — 메시지
+    길이/노이즈 방지.
+    """
+    try:
+        from config import STRICT_NOTIFY_INCLUDE_REASONS, STRICT_WEINSTEIN_MODE
+    except ImportError:
+        STRICT_NOTIFY_INCLUDE_REASONS = False
+        STRICT_WEINSTEIN_MODE         = False
+
     if buys:
         kr  = [s for s in buys if s["market"] == "KR"]
         us  = [s for s in buys if s["market"] == "US"]
@@ -383,9 +472,21 @@ def _notify(buys, sells, send_fn):
                 flag_warn = f" _{s.get('_market_flag', '')}_" if s.get("_market_flag") else ""
                 bq    = s.get("base_quality", "")
                 bq_str = f" | 베이스 {bq}" if bq and bq not in ("N/A", "NONE") else ""
+                # Strict 결과 메타 (opt-in)
+                strict_str = ""
+                if STRICT_NOTIFY_INCLUDE_REASONS:
+                    if s.get("strict_filter_passed") is True:
+                        strict_str = " | 🛡 strict-pass"
+                    reasons = s.get("filter_reasons") or []
+                    if reasons:
+                        # 통상 strict-pass 는 reasons=[] 이지만 legacy 모드/
+                        # debug 경로에서 들어올 수 있어 표기 — 최대 3개.
+                        joined = ", ".join(reasons[:3])
+                        more = "" if len(reasons) <= 3 else f" +{len(reasons)-3}"
+                        strict_str += f" | reasons={joined}{more}"
                 msg += (f"{ico}{gbadge}[{g}] *{s['name']}* ({s['ticker']})\n"
                         f"  • {s['signal_type']} | {p} | 거래량 {s['volume_ratio']:.1f}x"
-                        f"{bq_str}{flag_warn}\n"
+                        f"{bq_str}{flag_warn}{strict_str}\n"
                         f"  • 시그널일: {s['signal_date']}\n\n")
             if len(mkt_list) > 10:
                 msg += f"  ... 외 {len(mkt_list) - 10}개\n\n"
