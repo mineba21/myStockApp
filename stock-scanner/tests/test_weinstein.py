@@ -1630,6 +1630,113 @@ class TestNoLookAhead:
             f"signal 시점에는 zero-cross 없어야 함. last_view={last_view}, sig_view={sig_view}"
         )
 
+    def test_strict_gate_inputs_at_signal_date(self):
+        """analyze_stock 결과 dict 의 strict gate 입력 필드(price/ma150/sma30w/
+        slope30w/weekly_stage/weekly_volume_ratio/volume) 가 signal 시점 시리즈
+        기준인지 검증.
+
+        Phase 3 PR 리뷰 P1: detect_* 가 며칠 전 signal_date 를 반환하면 latest
+        bar 기준 price/ma150/weekly_stage/sma30w/slope30w/weekly_volume_ratio
+        는 신호 *이후* 데이터를 본 결과가 된다. Phase 4 에서 strict_filter 가
+        이 필드를 직접 소비하므로 회귀 시 Gate 3/7/8 의 통과/거부 판단이
+        비결정적이 된다.
+
+        픽스처: 5일 전 BREAKOUT + 그 이후 강세 지속(가격 110, 거래량 1M) →
+        signal-date 의 ma150/cur_p 와 last-bar 의 ma150/cur_p 가 명확히 차이.
+        """
+        from scanner.weinstein import (
+            analyze_stock, _build_indicators, classify_stage,
+            compute_weekly_indicators, to_weekly_ohlcv,
+        )
+
+        # 5일 전 BREAKOUT 픽스처 (test_analyze_stock_passes_signal_date_indicators 와 동일 구조)
+        prices, volumes = _make_stage2_base(n_total=230, base_price=100.0)
+        breakout_idx = len(prices) - 5
+        prices[breakout_idx]  = 104.0
+        volumes[breakout_idx] = 6_000_000
+        for i in range(breakout_idx + 1, len(prices)):
+            prices[i]  = 110.0
+            volumes[i] = 1_000_000
+
+        df = _make_df(prices, volumes)
+
+        res = analyze_stock(df, "TEST", "테스트", "US")
+        if res is None or res["signal_type"] != "BREAKOUT":
+            pytest.skip("BREAKOUT 시그널이 5일 전에 발생하지 않음 (픽스처 의존)")
+
+        sig_date = pd.Timestamp(res["signal_date"])
+        last_bar = df.index[-1]
+        # 회귀 검증 조건 — signal_date 가 last bar 이전이어야 비교 의미 있음
+        assert sig_date < last_bar, (
+            f"signal_date={sig_date} 가 last bar={last_bar} 이전이어야 픽스처 의도 충족"
+        )
+
+        # ── signal-date 기준 indicator 직접 계산 ──
+        df_sig     = df.loc[:sig_date]
+        d_sig      = _build_indicators(df_sig)
+        w_sig_df   = to_weekly_ohlcv(df_sig)
+        w_sig      = compute_weekly_indicators(w_sig_df) if len(w_sig_df) > 0 else None
+        stage_sig  = classify_stage(w_sig, d_sig)
+
+        # ── last-bar 기준 indicator (회귀 시 result 가 이 값을 내야 함) ──
+        d_last     = _build_indicators(df)
+        w_last     = compute_weekly_indicators(to_weekly_ohlcv(df))
+
+        # 픽스처가 의도대로 차이를 만들었는지 — 셋 중 하나라도 차이 있으면 OK
+        diff_present = (
+            abs(d_sig["cur_p"] - d_last["cur_p"]) > 0.5
+            or abs(d_sig["cur_m150"] - d_last["cur_m150"]) > 0.05
+            or (w_sig is not None and w_last is not None
+                and abs(w_sig["cur_sma30w"] - w_last["cur_sma30w"]) > 0.05)
+        )
+        if not diff_present:
+            pytest.skip("픽스처가 signal-date vs last-bar 차이를 만들지 못함")
+
+        # ── strict gate 입력 필드가 signal-date 값과 일치하는가 ──
+        assert abs(res["price"] - d_sig["cur_p"]) < 1e-3, (
+            f"result['price'] 가 last-bar 값. got={res['price']} "
+            f"sig={d_sig['cur_p']:.4f} last={d_last['cur_p']:.4f}"
+        )
+        assert abs(res["ma150"] - d_sig["cur_m150"]) < 1e-3, (
+            f"result['ma150'] 가 last-bar 값. got={res['ma150']} "
+            f"sig={d_sig['cur_m150']:.4f} last={d_last['cur_m150']:.4f}"
+        )
+        assert abs(res["ma50"] - d_sig["cur_m50"]) < 1e-3, (
+            f"result['ma50'] 가 last-bar 값. got={res['ma50']}"
+        )
+        # volume / volume_avg / ma_slope 도 signal-date 기준 (display 필드도 일관)
+        assert abs(res["ma_slope"] - d_sig["slope150"]) < 1e-4, (
+            f"result['ma_slope'] 가 last-bar 값."
+        )
+        assert int(d_sig["cur_v"]) == res["volume"], "result['volume'] 가 last-bar 값"
+        assert int(d_sig["cur_va"]) == res["volume_avg"], "result['volume_avg'] 가 last-bar 값"
+
+        # weekly_stage 가 signal-date 기준
+        assert res["weekly_stage"] == stage_sig, (
+            f"result['weekly_stage'] 가 last-bar 값. got={res['weekly_stage']} "
+            f"sig={stage_sig} last={classify_stage(w_last, d_last)}"
+        )
+
+        # weekly indicator 필드 (sma30w/slope30w/weekly_volume_ratio) 도 signal-date 기준
+        if w_sig is not None and w_last is not None:
+            assert abs(res["sma30w"] - w_sig["cur_sma30w"]) < 1e-3, (
+                f"result['sma30w'] 가 last-bar 값. got={res['sma30w']} "
+                f"sig={w_sig['cur_sma30w']:.4f} last={w_last['cur_sma30w']:.4f}"
+            )
+            assert abs(res["slope30w"] - w_sig["slope30w"]) < 1e-5, (
+                f"result['slope30w'] 가 last-bar 값. got={res['slope30w']} "
+                f"sig={w_sig['slope30w']:.6f} last={w_last['slope30w']:.6f}"
+            )
+            wvr_sig  = w_sig.get("weekly_volume_ratio")
+            wvr_last = w_last.get("weekly_volume_ratio")
+            if wvr_sig is not None and wvr_last is not None:
+                # weekly_volume_ratio 는 float 가 아닌 numpy.float64 가능 — 절대오차 비교
+                assert abs(float(res["weekly_volume_ratio"]) - float(wvr_sig)) < 1e-3, (
+                    f"result['weekly_volume_ratio'] 가 last-bar 값. "
+                    f"got={res['weekly_volume_ratio']} "
+                    f"sig={wvr_sig} last={wvr_last}"
+                )
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Strict Weinstein filter — Phase 1 scaffold
