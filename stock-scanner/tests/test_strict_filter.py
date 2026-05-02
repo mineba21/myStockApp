@@ -175,16 +175,31 @@ def _force_all_strict_flags(monkeypatch, *,
 
 
 def _full_passing_breakout_signal(**overrides):
-    """8 게이트 모두 통과하는 baseline BREAKOUT 시그널 dict."""
+    """8 게이트 모두 통과하는 baseline BREAKOUT 시그널 dict.
+
+    공개 필드(price/ma150/sma30w/...) 는 display/persist 용으로 유지하되,
+    Gate 3/5/7/8 은 ``strict_*`` 스냅샷만 읽으므로 두 부류를 모두 갖는다.
+    헬퍼는 ``signal_date == last_bar`` 즉 두 값이 동일한 normal-case 를
+    표현. 게이트별 단위 테스트가 필요할 때 override 로 차이를 줄 수 있다.
+    """
     sig = {
         "signal_type":         "BREAKOUT",
+        # 공개 (display/persist) — last-bar 의미
         "price":               110.0,
-        "ma150":               100.0,    # ext = +10% (< 15% limit)
-        "sma30w":               95.0,    # ext_w = +15.8% (< 30% limit)
-        "slope30w":              0.5,    # 양수
+        "ma150":               100.0,
+        "sma30w":               95.0,
+        "slope30w":              0.5,
         "weekly_stage":         "STAGE2",
-        "volume_ratio":          3.5,    # ≥ 3.0
-        "weekly_volume_ratio":   2.5,    # ≥ 2.0
+        "volume_ratio":          3.5,    # detect_* 가 sig 그대로 노출 → signal-date
+        "weekly_volume_ratio":   2.5,
+        # strict_* (gate 평가) — signal-date 의미
+        "strict_price":              110.0,    # ext = +10% (< 15% limit)
+        "strict_ma150":              100.0,
+        "strict_sma30w":              95.0,    # ext_w = +15.8% (< 30% limit)
+        "strict_slope30w":             0.5,    # 양수
+        "strict_weekly_stage":     "STAGE2",
+        "strict_weekly_volume_ratio":  2.5,    # ≥ 2.0
+        # base / RS / stop
         "pivot_price":         105.0,
         "base_low":             95.0,
         "base_weeks":            8.0,    # ≥ BASE_MIN_WEEKS=5
@@ -192,7 +207,7 @@ def _full_passing_breakout_signal(**overrides):
         "rs_value":              4.5,
         "rs_trend":             "RISING",
         "rs_zero_crossed":     True,
-        "stop_loss":            94.0,    # < price=110
+        "stop_loss":            94.0,    # < strict_price=110
     }
     sig.update(overrides)
     return sig
@@ -327,8 +342,8 @@ class TestStageGate:
         self._flags(monkeypatch)
 
         reasons = []
-        _check_weekly_stage({"signal_type": "BREAKOUT", "price": 100.0,
-                             "sma30w": None, "weekly_stage": None}, reasons)
+        _check_weekly_stage({"signal_type": "BREAKOUT", "strict_price": 100.0,
+                             "strict_sma30w": None, "strict_weekly_stage": None}, reasons)
         assert WEEKLY_DATA_MISSING in reasons
 
     def test_below_weekly_30ma_blocks(self, monkeypatch):
@@ -336,9 +351,9 @@ class TestStageGate:
         self._flags(monkeypatch)
 
         reasons = []
-        _check_weekly_stage({"signal_type": "BREAKOUT", "price": 90.0,
-                             "ma150": 85.0, "sma30w": 95.0,
-                             "slope30w": 0.5, "weekly_stage": "STAGE2"}, reasons)
+        _check_weekly_stage({"signal_type": "BREAKOUT", "strict_price": 90.0,
+                             "strict_ma150": 85.0, "strict_sma30w": 95.0,
+                             "strict_slope30w": 0.5, "strict_weekly_stage": "STAGE2"}, reasons)
         assert BELOW_WEEKLY_30MA in reasons
 
     def test_below_daily_150ma_breakout(self, monkeypatch):
@@ -346,10 +361,10 @@ class TestStageGate:
         self._flags(monkeypatch)
 
         reasons = []
-        # price 가 sma30w 위지만 ma150 아래 — BREAKOUT 만 차단
-        _check_weekly_stage({"signal_type": "BREAKOUT", "price": 96.0,
-                             "ma150": 100.0, "sma30w": 95.0,
-                             "slope30w": 0.5, "weekly_stage": "STAGE2"}, reasons)
+        # strict_price 가 strict_sma30w 위지만 strict_ma150 아래 — BREAKOUT 만 차단
+        _check_weekly_stage({"signal_type": "BREAKOUT", "strict_price": 96.0,
+                             "strict_ma150": 100.0, "strict_sma30w": 95.0,
+                             "strict_slope30w": 0.5, "strict_weekly_stage": "STAGE2"}, reasons)
         assert BELOW_DAILY_150MA in reasons
 
     def test_below_daily_150ma_does_not_block_rebound(self, monkeypatch):
@@ -358,9 +373,9 @@ class TestStageGate:
         self._flags(monkeypatch)
 
         reasons = []
-        _check_weekly_stage({"signal_type": "REBOUND", "price": 96.0,
-                             "ma150": 100.0, "sma30w": 95.0,
-                             "slope30w": 0.5, "weekly_stage": "STAGE2"}, reasons)
+        _check_weekly_stage({"signal_type": "REBOUND", "strict_price": 96.0,
+                             "strict_ma150": 100.0, "strict_sma30w": 95.0,
+                             "strict_slope30w": 0.5, "strict_weekly_stage": "STAGE2"}, reasons)
         assert BELOW_DAILY_150MA not in reasons
 
     def test_stage3_blocks(self, monkeypatch):
@@ -368,9 +383,9 @@ class TestStageGate:
         self._flags(monkeypatch)
 
         reasons = []
-        _check_weekly_stage({"signal_type": "BREAKOUT", "price": 110.0,
-                             "ma150": 100.0, "sma30w": 95.0,
-                             "slope30w": 0.0, "weekly_stage": "STAGE3"}, reasons)
+        _check_weekly_stage({"signal_type": "BREAKOUT", "strict_price": 110.0,
+                             "strict_ma150": 100.0, "strict_sma30w": 95.0,
+                             "strict_slope30w": 0.0, "strict_weekly_stage": "STAGE3"}, reasons)
         assert STAGE_STAGE3 in reasons
 
     def test_stage4_blocks(self, monkeypatch):
@@ -378,9 +393,9 @@ class TestStageGate:
         self._flags(monkeypatch)
 
         reasons = []
-        _check_weekly_stage({"signal_type": "BREAKOUT", "price": 110.0,
-                             "ma150": 100.0, "sma30w": 95.0,
-                             "slope30w": -0.5, "weekly_stage": "STAGE4"}, reasons)
+        _check_weekly_stage({"signal_type": "BREAKOUT", "strict_price": 110.0,
+                             "strict_ma150": 100.0, "strict_sma30w": 95.0,
+                             "strict_slope30w": -0.5, "strict_weekly_stage": "STAGE4"}, reasons)
         assert STAGE_STAGE4 in reasons
 
     def test_stage2_with_negative_slope_blocks(self, monkeypatch):
@@ -388,9 +403,9 @@ class TestStageGate:
         self._flags(monkeypatch)
 
         reasons = []
-        _check_weekly_stage({"signal_type": "BREAKOUT", "price": 110.0,
-                             "ma150": 100.0, "sma30w": 95.0,
-                             "slope30w": -0.1, "weekly_stage": "STAGE2"}, reasons)
+        _check_weekly_stage({"signal_type": "BREAKOUT", "strict_price": 110.0,
+                             "strict_ma150": 100.0, "strict_sma30w": 95.0,
+                             "strict_slope30w": -0.1, "strict_weekly_stage": "STAGE2"}, reasons)
         assert WEEKLY_30MA_SLOPE_NEGATIVE in reasons
 
     def test_stage2_with_positive_slope_passes(self, monkeypatch):
@@ -398,9 +413,9 @@ class TestStageGate:
         self._flags(monkeypatch)
 
         reasons = []
-        _check_weekly_stage({"signal_type": "BREAKOUT", "price": 110.0,
-                             "ma150": 100.0, "sma30w": 95.0,
-                             "slope30w": 0.5, "weekly_stage": "STAGE2"}, reasons)
+        _check_weekly_stage({"signal_type": "BREAKOUT", "strict_price": 110.0,
+                             "strict_ma150": 100.0, "strict_sma30w": 95.0,
+                             "strict_slope30w": 0.5, "strict_weekly_stage": "STAGE2"}, reasons)
         assert reasons == []
 
 
@@ -476,7 +491,7 @@ class TestVolumeGate:
         reasons = []
         _check_volume({"signal_type": "BREAKOUT",
                        "volume_ratio": 1.5,
-                       "weekly_volume_ratio": 2.5}, reasons)
+                       "strict_weekly_volume_ratio": 2.5}, reasons)
         assert BREAKOUT_DAILY_VOLUME in reasons
 
     def test_low_weekly_volume_blocks_breakout(self, monkeypatch):
@@ -488,7 +503,7 @@ class TestVolumeGate:
         reasons = []
         _check_volume({"signal_type": "BREAKOUT",
                        "volume_ratio": 3.5,
-                       "weekly_volume_ratio": 1.0}, reasons)
+                       "strict_weekly_volume_ratio": 1.0}, reasons)
         assert BREAKOUT_WEEKLY_VOLUME in reasons
 
     def test_volume_gate_skips_rebound(self, monkeypatch):
@@ -498,7 +513,7 @@ class TestVolumeGate:
         reasons = []
         _check_volume({"signal_type": "REBOUND",
                        "volume_ratio": 0.5,
-                       "weekly_volume_ratio": 0.5}, reasons)
+                       "strict_weekly_volume_ratio": 0.5}, reasons)
         assert reasons == []
 
     def test_disabled_passes(self, monkeypatch):
@@ -508,18 +523,18 @@ class TestVolumeGate:
         reasons = []
         _check_volume({"signal_type": "BREAKOUT",
                        "volume_ratio": 0.1,
-                       "weekly_volume_ratio": 0.1}, reasons)
+                       "strict_weekly_volume_ratio": 0.1}, reasons)
         assert reasons == []
 
     def test_missing_weekly_ratio_does_not_block(self, monkeypatch):
-        """주봉 데이터 부재(weekly_volume_ratio=None)는 Gate 3 으로 흡수."""
+        """주봉 데이터 부재(strict_weekly_volume_ratio=None)는 Gate 3 으로 흡수."""
         from scanner.strict_filter import _check_volume, BREAKOUT_WEEKLY_VOLUME
         _force_strict_flag(monkeypatch, "STRICT_REQUIRE_BREAKOUT_VOLUME", True)
 
         reasons = []
         _check_volume({"signal_type": "BREAKOUT",
                        "volume_ratio": 5.0,
-                       "weekly_volume_ratio": None}, reasons)
+                       "strict_weekly_volume_ratio": None}, reasons)
         assert BREAKOUT_WEEKLY_VOLUME not in reasons
 
 
@@ -533,10 +548,10 @@ class TestExtensionGate:
         _force_strict_flag(monkeypatch, "BREAKOUT_MAX_EXTENDED_PCT", 15.0)
 
         reasons = []
-        # +20% over ma150
+        # +20% over strict_ma150
         _check_extension({"signal_type": "BREAKOUT",
-                          "price": 120.0, "ma150": 100.0,
-                          "sma30w":  95.0}, reasons)
+                          "strict_price": 120.0, "strict_ma150": 100.0,
+                          "strict_sma30w":  95.0}, reasons)
         assert EXTENDED_ABOVE_MA150 in reasons
 
     def test_extended_above_30w_blocks_breakout(self, monkeypatch):
@@ -546,8 +561,8 @@ class TestExtensionGate:
         reasons = []
         # MA150 +10% (under limit) but 30W +35% (over 30%)
         _check_extension({"signal_type": "BREAKOUT",
-                          "price": 110.0, "ma150": 100.0,
-                          "sma30w":  81.0}, reasons)   # 110/81 - 1 ≈ +35.8%
+                          "strict_price": 110.0, "strict_ma150": 100.0,
+                          "strict_sma30w":  81.0}, reasons)   # 110/81 - 1 ≈ +35.8%
         assert EXTENDED_ABOVE_30W in reasons
 
     def test_extended_above_30w_does_not_apply_to_rebound(self, monkeypatch):
@@ -557,8 +572,8 @@ class TestExtensionGate:
 
         reasons = []
         _check_extension({"signal_type": "REBOUND",
-                          "price": 110.0, "ma150": 100.0,
-                          "sma30w":  81.0}, reasons)
+                          "strict_price": 110.0, "strict_ma150": 100.0,
+                          "strict_sma30w":  81.0}, reasons)
         assert EXTENDED_ABOVE_30W not in reasons
 
     def test_within_limit_passes(self, monkeypatch):
@@ -567,8 +582,8 @@ class TestExtensionGate:
 
         reasons = []
         _check_extension({"signal_type": "BREAKOUT",
-                          "price": 110.0, "ma150": 100.0,
-                          "sma30w":  95.0}, reasons)
+                          "strict_price": 110.0, "strict_ma150": 100.0,
+                          "strict_sma30w":  95.0}, reasons)
         assert reasons == []
 
 
@@ -582,7 +597,7 @@ class TestStopLossGate:
         _force_strict_flag(monkeypatch, "STRICT_REQUIRE_STOP_LOSS", True)
 
         reasons = []
-        _check_stop_loss({"stop_loss": None, "price": 100.0}, reasons)
+        _check_stop_loss({"stop_loss": None, "strict_price": 100.0}, reasons)
         assert STOP_LOSS_MISSING in reasons
 
     def test_missing_stop_loss_passes_when_not_required(self, monkeypatch):
@@ -590,23 +605,27 @@ class TestStopLossGate:
         _force_strict_flag(monkeypatch, "STRICT_REQUIRE_STOP_LOSS", False)
 
         reasons = []
-        _check_stop_loss({"stop_loss": None, "price": 100.0}, reasons)
+        _check_stop_loss({"stop_loss": None, "strict_price": 100.0}, reasons)
         assert STOP_LOSS_MISSING not in reasons
 
     def test_stop_above_price_blocks_always(self, monkeypatch):
-        """sanity 검사는 STRICT_REQUIRE_STOP_LOSS 와 무관 — 항상 활성."""
+        """sanity 검사는 STRICT_REQUIRE_STOP_LOSS 와 무관 — 항상 활성.
+
+        sanity 비교 대상은 ``strict_price`` (signal-date close) — Phase 2 에서
+        stop_loss 가 신호일 가격 기준으로 산출되므로 일관성 위해.
+        """
         from scanner.strict_filter import _check_stop_loss, STOP_LOSS_ABOVE_PRICE
         _force_strict_flag(monkeypatch, "STRICT_REQUIRE_STOP_LOSS", False)
 
         reasons = []
-        _check_stop_loss({"stop_loss": 105.0, "price": 100.0}, reasons)
+        _check_stop_loss({"stop_loss": 105.0, "strict_price": 100.0}, reasons)
         assert STOP_LOSS_ABOVE_PRICE in reasons
 
     def test_stop_equal_price_blocks(self, monkeypatch):
-        """stop == price (의미 없음) 도 sanity 차단."""
+        """stop == strict_price (의미 없음) 도 sanity 차단."""
         from scanner.strict_filter import _check_stop_loss, STOP_LOSS_ABOVE_PRICE
         reasons = []
-        _check_stop_loss({"stop_loss": 100.0, "price": 100.0}, reasons)
+        _check_stop_loss({"stop_loss": 100.0, "strict_price": 100.0}, reasons)
         assert STOP_LOSS_ABOVE_PRICE in reasons
 
     def test_valid_stop_passes(self, monkeypatch):
@@ -614,7 +633,7 @@ class TestStopLossGate:
         _force_strict_flag(monkeypatch, "STRICT_REQUIRE_STOP_LOSS", True)
 
         reasons = []
-        _check_stop_loss({"stop_loss": 95.0, "price": 100.0}, reasons)
+        _check_stop_loss({"stop_loss": 95.0, "strict_price": 100.0}, reasons)
         assert reasons == []
 
 

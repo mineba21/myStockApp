@@ -1631,15 +1631,22 @@ class TestNoLookAhead:
         )
 
     def test_strict_gate_inputs_at_signal_date(self):
-        """analyze_stock 결과 dict 의 strict gate 입력 필드(price/ma150/sma30w/
-        slope30w/weekly_stage/weekly_volume_ratio/volume) 가 signal 시점 시리즈
-        기준인지 검증.
+        """analyze_stock 결과 dict 의 *공개* 필드와 *strict_* 필드가 각각
+        의도된 의미(last-bar vs signal-date)로 동시에 채워지는지 검증.
 
-        Phase 3 PR 리뷰 P1: detect_* 가 며칠 전 signal_date 를 반환하면 latest
-        bar 기준 price/ma150/weekly_stage/sma30w/slope30w/weekly_volume_ratio
-        는 신호 *이후* 데이터를 본 결과가 된다. Phase 4 에서 strict_filter 가
-        이 필드를 직접 소비하므로 회귀 시 Gate 3/7/8 의 통과/거부 판단이
-        비결정적이 된다.
+        리뷰 히스토리:
+          - 1차 P1: detect_* 가 며칠 전 signal_date 를 반환할 때 strict gate 가
+            last-bar price/ma150/sma30w/... 을 읽으면 신호 *이후* 데이터로 평가
+            되어 no-look-ahead invariant 가 깨짐.
+          - 2차 P1: 1차 수정이 공개 필드(``price``/``ma150``/``volume``/
+            ``weekly_stage``/``sma30w``/...) 를 signal-date 로 재할당해 버려
+            ``ScanResult.price`` / Telegram 알림 / ``/api/results`` / UI 의
+            "현재가" / 관심종목 ``buy_price`` 가 며칠 전 가격을 표시하게 되어
+            Phase 4 PR 의 no-op 보장이 깨졌다.
+
+        최종 설계: **공개 필드는 last-bar 유지** (display/persist 의미 보존).
+        **strict_* 스냅샷 필드를 별도로 도입** 하여 ``apply_strict_filter`` 만
+        그 키들을 읽도록 분리. 이 테스트는 두 invariant 를 *동시에* 단언한다.
 
         픽스처: 5일 전 BREAKOUT + 그 이후 강세 지속(가격 110, 거래량 1M) →
         signal-date 의 ma150/cur_p 와 last-bar 의 ma150/cur_p 가 명확히 차이.
@@ -1671,16 +1678,17 @@ class TestNoLookAhead:
             f"signal_date={sig_date} 가 last bar={last_bar} 이전이어야 픽스처 의도 충족"
         )
 
-        # ── signal-date 기준 indicator 직접 계산 ──
+        # ── signal-date 기준 indicator 직접 계산 (strict_* 가 매칭되어야 함) ──
         df_sig     = df.loc[:sig_date]
         d_sig      = _build_indicators(df_sig)
         w_sig_df   = to_weekly_ohlcv(df_sig)
         w_sig      = compute_weekly_indicators(w_sig_df) if len(w_sig_df) > 0 else None
         stage_sig  = classify_stage(w_sig, d_sig)
 
-        # ── last-bar 기준 indicator (회귀 시 result 가 이 값을 내야 함) ──
+        # ── last-bar 기준 indicator (공개 필드가 매칭되어야 함) ──
         d_last     = _build_indicators(df)
         w_last     = compute_weekly_indicators(to_weekly_ohlcv(df))
+        stage_last = classify_stage(w_last, d_last)
 
         # 픽스처가 의도대로 차이를 만들었는지 — 셋 중 하나라도 차이 있으면 OK
         diff_present = (
@@ -1692,49 +1700,78 @@ class TestNoLookAhead:
         if not diff_present:
             pytest.skip("픽스처가 signal-date vs last-bar 차이를 만들지 못함")
 
-        # ── strict gate 입력 필드가 signal-date 값과 일치하는가 ──
-        assert abs(res["price"] - d_sig["cur_p"]) < 1e-3, (
-            f"result['price'] 가 last-bar 값. got={res['price']} "
-            f"sig={d_sig['cur_p']:.4f} last={d_last['cur_p']:.4f}"
+        # ══════════════════════════════════════════════════════════════
+        # Invariant A — 공개 필드는 *last-bar* 유지 (display/persist 의미)
+        # ══════════════════════════════════════════════════════════════
+        assert abs(res["price"] - d_last["cur_p"]) < 1e-3, (
+            f"result['price'] 는 last-bar 가격이어야 함 (display). "
+            f"got={res['price']} last={d_last['cur_p']:.4f} sig={d_sig['cur_p']:.4f}"
         )
-        assert abs(res["ma150"] - d_sig["cur_m150"]) < 1e-3, (
-            f"result['ma150'] 가 last-bar 값. got={res['ma150']} "
-            f"sig={d_sig['cur_m150']:.4f} last={d_last['cur_m150']:.4f}"
+        assert abs(res["ma150"] - d_last["cur_m150"]) < 1e-3, (
+            f"result['ma150'] 는 last-bar 값이어야 함. "
+            f"got={res['ma150']} last={d_last['cur_m150']:.4f} sig={d_sig['cur_m150']:.4f}"
         )
-        assert abs(res["ma50"] - d_sig["cur_m50"]) < 1e-3, (
-            f"result['ma50'] 가 last-bar 값. got={res['ma50']}"
+        assert abs(res["ma50"] - d_last["cur_m50"]) < 1e-3, (
+            f"result['ma50'] 는 last-bar 값이어야 함. got={res['ma50']}"
         )
-        # volume / volume_avg / ma_slope 도 signal-date 기준 (display 필드도 일관)
-        assert abs(res["ma_slope"] - d_sig["slope150"]) < 1e-4, (
-            f"result['ma_slope'] 가 last-bar 값."
+        assert abs(res["ma_slope"] - d_last["slope150"]) < 1e-4, (
+            f"result['ma_slope'] 는 last-bar 값이어야 함."
         )
-        assert int(d_sig["cur_v"]) == res["volume"], "result['volume'] 가 last-bar 값"
-        assert int(d_sig["cur_va"]) == res["volume_avg"], "result['volume_avg'] 가 last-bar 값"
-
-        # weekly_stage 가 signal-date 기준
-        assert res["weekly_stage"] == stage_sig, (
-            f"result['weekly_stage'] 가 last-bar 값. got={res['weekly_stage']} "
-            f"sig={stage_sig} last={classify_stage(w_last, d_last)}"
+        assert int(d_last["cur_v"])  == res["volume"],     "result['volume'] 는 last-bar 거래량"
+        assert int(d_last["cur_va"]) == res["volume_avg"], "result['volume_avg'] 는 last-bar 평균"
+        assert res["weekly_stage"] == stage_last, (
+            f"result['weekly_stage'] 는 last-bar 분류여야 함. "
+            f"got={res['weekly_stage']} last={stage_last} sig={stage_sig}"
         )
-
-        # weekly indicator 필드 (sma30w/slope30w/weekly_volume_ratio) 도 signal-date 기준
         if w_sig is not None and w_last is not None:
-            assert abs(res["sma30w"] - w_sig["cur_sma30w"]) < 1e-3, (
-                f"result['sma30w'] 가 last-bar 값. got={res['sma30w']} "
-                f"sig={w_sig['cur_sma30w']:.4f} last={w_last['cur_sma30w']:.4f}"
+            assert abs(res["sma30w"] - w_last["cur_sma30w"]) < 1e-3, (
+                f"result['sma30w'] 는 last-bar 값이어야 함. "
+                f"got={res['sma30w']} last={w_last['cur_sma30w']:.4f} sig={w_sig['cur_sma30w']:.4f}"
             )
-            assert abs(res["slope30w"] - w_sig["slope30w"]) < 1e-5, (
-                f"result['slope30w'] 가 last-bar 값. got={res['slope30w']} "
-                f"sig={w_sig['slope30w']:.6f} last={w_last['slope30w']:.6f}"
+            assert abs(res["slope30w"] - w_last["slope30w"]) < 1e-5, (
+                f"result['slope30w'] 는 last-bar 값이어야 함."
             )
-            wvr_sig  = w_sig.get("weekly_volume_ratio")
             wvr_last = w_last.get("weekly_volume_ratio")
-            if wvr_sig is not None and wvr_last is not None:
-                # weekly_volume_ratio 는 float 가 아닌 numpy.float64 가능 — 절대오차 비교
-                assert abs(float(res["weekly_volume_ratio"]) - float(wvr_sig)) < 1e-3, (
-                    f"result['weekly_volume_ratio'] 가 last-bar 값. "
-                    f"got={res['weekly_volume_ratio']} "
-                    f"sig={wvr_sig} last={wvr_last}"
+            if wvr_last is not None and res.get("weekly_volume_ratio") is not None:
+                assert abs(float(res["weekly_volume_ratio"]) - float(wvr_last)) < 1e-3, (
+                    f"result['weekly_volume_ratio'] 는 last-bar 값이어야 함. "
+                    f"got={res['weekly_volume_ratio']} last={wvr_last} "
+                    f"sig={w_sig.get('weekly_volume_ratio')}"
+                )
+
+        # ══════════════════════════════════════════════════════════════
+        # Invariant B — strict_* 스냅샷은 *signal-date* 값
+        # apply_strict_filter 가 이 키들만 읽어 no-look-ahead 보장.
+        # ══════════════════════════════════════════════════════════════
+        assert abs(res["strict_price"] - d_sig["cur_p"]) < 1e-3, (
+            f"result['strict_price'] 는 signal-date 종가여야 함. "
+            f"got={res['strict_price']} sig={d_sig['cur_p']:.4f} last={d_last['cur_p']:.4f}"
+        )
+        assert abs(res["strict_ma150"] - d_sig["cur_m150"]) < 1e-3, (
+            f"result['strict_ma150'] 는 signal-date MA150 이어야 함. "
+            f"got={res['strict_ma150']} sig={d_sig['cur_m150']:.4f} last={d_last['cur_m150']:.4f}"
+        )
+        assert abs(res["strict_ma50"] - d_sig["cur_m50"]) < 1e-3, (
+            f"result['strict_ma50'] 는 signal-date MA50 이어야 함. got={res['strict_ma50']}"
+        )
+        assert res["strict_weekly_stage"] == stage_sig, (
+            f"result['strict_weekly_stage'] 는 signal-date 분류여야 함. "
+            f"got={res['strict_weekly_stage']} sig={stage_sig} last={stage_last}"
+        )
+        if w_sig is not None:
+            assert abs(res["strict_sma30w"] - w_sig["cur_sma30w"]) < 1e-3, (
+                f"result['strict_sma30w'] 는 signal-date 30W SMA 여야 함. "
+                f"got={res['strict_sma30w']} sig={w_sig['cur_sma30w']:.4f} "
+                f"last={w_last['cur_sma30w']:.4f if w_last else 'N/A'}"
+            )
+            assert abs(res["strict_slope30w"] - w_sig["slope30w"]) < 1e-5, (
+                f"result['strict_slope30w'] 는 signal-date 기울기여야 함."
+            )
+            wvr_sig = w_sig.get("weekly_volume_ratio")
+            if wvr_sig is not None and res.get("strict_weekly_volume_ratio") is not None:
+                assert abs(float(res["strict_weekly_volume_ratio"]) - float(wvr_sig)) < 1e-3, (
+                    f"result['strict_weekly_volume_ratio'] 는 signal-date 비율이어야 함. "
+                    f"got={res['strict_weekly_volume_ratio']} sig={wvr_sig}"
                 )
 
 

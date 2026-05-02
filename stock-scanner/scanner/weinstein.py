@@ -1114,22 +1114,25 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
     # signal 시점 close — stop_loss sanity 비교 (stop < price) 가 일관되도록.
     sig_close = float(df_at_signal["Close"].iloc[-1]) if len(df_at_signal) else cur_p
 
-    # ── Phase 3 follow-up — strict gate 입력 전부를 signal-date 스냅샷으로 통일 ──
-    # detect_* 가 며칠 전 signal_date 를 반환하면 latest-bar 기준 price/ma150/
-    # weekly_stage/sma30w/slope30w/weekly_volume_ratio/volume 은 신호 *이후*
-    # 데이터를 본 결과가 된다. Phase 4 에서 strict_filter 가 이 필드를 직접
-    # 소비하므로 이 시점에 로컬 변수와 result dict 모두 signal-date 값으로
-    # 일괄 재할당해 no-look-ahead invariant 를 강제한다.
-    # 데이터 부족(MA_PERIOD 미만) 으로 daily_at_signal 이 daily_ind 로
-    # fallback 한 경우엔 자연스럽게 last-bar 와 동일해져 동작 변화가 없다.
-    cur_p    = daily_at_signal["cur_p"]
-    cur_m150 = daily_at_signal["cur_m150"]
-    cur_v    = daily_at_signal["cur_v"]
-    cur_va   = daily_at_signal["cur_va"]
-    slope    = daily_at_signal["slope150"]
-    pct      = (cur_p - cur_m150) / cur_m150 * 100 if cur_m150 else 0.0
-    # weekly_stage / sma30w / slope30w 도 signal 시점 weekly indicator 기준
-    v4_stage = classify_stage(weekly_at_signal, daily_at_signal)
+    # ── Phase 3 follow-up — strict gate 전용 signal-date 스냅샷 필드 ──
+    # 공개 필드(price/ma150/volume/stage/sma30w 등) 는 _save() 가 "최신 가격"
+    # 으로 사용하고 알림/UI 가 "현재가" 로 표시하므로 *항상 last-bar* 기준을
+    # 유지해야 한다. strict_filter 는 별도 strict_* 필드(아래) 만 읽도록 분리
+    # 해 no-look-ahead invariant 와 공개 필드 의미를 동시에 보존.
+    # daily_at_signal 이 fallback 으로 daily_ind 와 동일한 경우에도 동일 값
+    # 으로 전파되므로 안전.
+    strict_price          = round(daily_at_signal["cur_p"],    4)
+    strict_ma150          = round(daily_at_signal["cur_m150"], 4)
+    strict_ma50           = round(daily_at_signal["cur_m50"],  4)
+    strict_weekly_stage   = classify_stage(weekly_at_signal, daily_at_signal)
+    strict_sma30w: Optional[float] = None
+    strict_slope30w: Optional[float] = None
+    strict_weekly_volume_ratio: Optional[float] = None
+    if weekly_at_signal is not None:
+        strict_sma30w              = round(weekly_at_signal["cur_sma30w"], 4)
+        strict_slope30w            = round(weekly_at_signal["slope30w"],   6)
+        wvr_sig                    = weekly_at_signal.get("weekly_volume_ratio")
+        strict_weekly_volume_ratio = float(wvr_sig) if wvr_sig is not None else None
 
     # ── Mansfield RS (v4) + legacy ratio RS — signal 시점까지의 시리즈로 산출 ──
     rs_value, rs_trend = (None, None)
@@ -1173,11 +1176,11 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
         "name":            name,
         "market":          market,
         "signal_type":     sig["signal_type"],
-        "stage":           daily_at_signal["stage"], # legacy — 일봉 기준 (signal-date)
-        "weekly_stage":    v4_stage,                 # v4 — 주봉 기준 (signal-date)
+        "stage":           daily_ind["stage"],       # legacy — 일봉 기준 (last-bar, 공개 표시용)
+        "weekly_stage":    v4_stage,                 # v4 — 주봉 기준 (last-bar, 공개 표시용)
         "price":           round(cur_p, 4),
         "ma150":           round(cur_m150, 4),
-        "ma50":            round(daily_at_signal["cur_m50"], 4),
+        "ma50":            round(daily_ind["cur_m50"], 4),
         "price_vs_ma_pct": round(pct, 2),
         "ma_slope":        round(slope, 4),
         "volume":          int(cur_v),
@@ -1209,16 +1212,26 @@ def analyze_stock(df: pd.DataFrame, ticker: str, name: str, market: str,
         "rs_zero_crossed":      rs_zero_crossed,
         "strict_filter_passed": None,
         "filter_reasons":       [],
+        # ── Strict-only signal-date 스냅샷 (Phase 3 follow-up) ──
+        # apply_strict_filter / scan_engine 에서 strict gate 평가용으로만 소비.
+        # 공개 필드 price/ma150/sma30w 등은 last-bar 의미를 유지하므로 stale
+        # 신호도 알림/UI/DB persistence 가 정상 "현재가" 를 보여준다.
+        # detect_* 가 며칠 전 signal_date 를 반환할 때 strict_* 와 공개 필드의
+        # 값이 의도적으로 어긋나는 것이 invariant.
+        "strict_price":               strict_price,
+        "strict_ma150":               strict_ma150,
+        "strict_ma50":                strict_ma50,
+        "strict_weekly_stage":        strict_weekly_stage,
+        "strict_sma30w":              strict_sma30w,
+        "strict_slope30w":            strict_slope30w,
+        "strict_weekly_volume_ratio": strict_weekly_volume_ratio,
     }
-    if weekly_at_signal is not None:
-        # Phase 3 follow-up — weekly_at_signal (signal 시점 weekly indicator)
-        # 사용. weekly_ind (last bar) 를 그대로 쓰면 sma30w/slope30w/
-        # weekly_volume_ratio 가 신호 이후 주봉 데이터를 본 결과가 된다.
-        result["sma30w"] = round(weekly_at_signal["cur_sma30w"], 4)
-        result["sma10w"] = round(weekly_at_signal["cur_sma10w"], 4)
-        result["weekly_volume_ratio"] = weekly_at_signal.get("weekly_volume_ratio")
-        # Phase 3 — Strict Gate 3 (Weekly Stage) 가 STAGE2 + slope ≤ 0 차단
-        result["slope30w"] = round(weekly_at_signal["slope30w"], 6)
+    if weekly_ind is not None:
+        # 공개 필드 — last-bar 기준 (display/persist 의미 보존)
+        result["sma30w"] = round(weekly_ind["cur_sma30w"], 4)
+        result["sma10w"] = round(weekly_ind["cur_sma10w"], 4)
+        result["weekly_volume_ratio"] = weekly_ind.get("weekly_volume_ratio")
+        result["slope30w"] = round(weekly_ind["slope30w"], 6)
     return result
 
 

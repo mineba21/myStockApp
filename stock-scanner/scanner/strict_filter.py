@@ -29,6 +29,22 @@ DB(``scan_results.filter_reasons`` JSON) 와 모니터링 대시보드가 이 en
 문자열에 의존하므로, **상수 값을 바꾸면 changelog 의무**. 새 enum 값을
 추가하는 것은 안전하지만, 기존 값을 변경/삭제하면 forward-compat 가
 깨진다.
+
+## signal dict 입력 규약 (no-look-ahead)
+
+각 게이트는 두 부류의 키를 구분해 소비한다.
+
+* **공개 필드** (``price``/``ma150``/``sma30w``/``volume``/``stage`` 등)
+  은 last-bar 기준이라 stale 신호에서 신호일 *이후* 데이터를 본 결과다.
+  strict gate 는 이 필드를 직접 읽지 **않는다**.
+* **``strict_*`` 스냅샷** (``strict_price``/``strict_ma150``/
+  ``strict_sma30w``/``strict_slope30w``/``strict_weekly_stage``/
+  ``strict_weekly_volume_ratio`` 등) 은 weinstein.analyze_stock 가
+  ``signal_date`` 까지 슬라이스한 indicator 로 계산. **Gate 3/5/7/8 입력은
+  반드시 strict_* 만 사용**.
+
+이 분리 덕분에 알림/UI/DB persistence 는 last-bar "현재가" 의미를 유지
+하면서, strict 평가는 신호 시점 진실값으로 결정성을 보장한다.
 """
 from typing import Any, Dict, List, Tuple
 
@@ -157,25 +173,31 @@ def _check_weekly_stage(signal: Dict[str, Any],
 
     주봉 30MA 위 상승 진행(STAGE2 + slope>0) + (BREAKOUT 만)일봉 MA150 위.
 
+    **모든 입력은 signal-date 스냅샷 필드(``strict_*``) 사용.** 공개 필드
+    ``price``/``ma150``/``sma30w``/``weekly_stage``/``slope30w`` 는 last-bar
+    기준이라 stale 신호에서 look-ahead 됨.
+
     검사 항목:
       1. 주봉 데이터 자체 없음                      → "weekly_data_missing"
       2. STRICT_REQUIRE_PRICE_ABOVE_WEEKLY_30MA
-         price < cur_sma30w                          → "below_weekly_30ma"
+         strict_price < strict_sma30w                → "below_weekly_30ma"
       3. BREAKOUT + STRICT_REQUIRE_PRICE_ABOVE_DAILY_150MA
-         price < ma150                               → "below_daily_150ma"
-      4. weekly_stage in {STAGE3, STAGE4}            → "stage_stage3" / "stage_stage4"
-      5. weekly_stage == STAGE2 + slope30w <= 0      → "weekly_30ma_slope_negative"
+         strict_price < strict_ma150                 → "below_daily_150ma"
+      4. strict_weekly_stage in {STAGE3, STAGE4}     → "stage_stage3" / "stage_stage4"
+      5. strict_weekly_stage == STAGE2 + strict_slope30w <= 0
+                                                    → "weekly_30ma_slope_negative"
 
     Args:
-        signal: 필요 키: signal_type, price, ma150, sma30w, slope30w, weekly_stage.
+        signal: 필요 키: signal_type, strict_price, strict_ma150,
+                strict_sma30w, strict_slope30w, strict_weekly_stage.
     """
-    sma30w = signal.get("sma30w")
+    sma30w = signal.get("strict_sma30w")
     if sma30w is None:
         # 주봉 시리즈 자체 없음 — 후속 비교 의미 없음, 이 사유만 기록.
         reasons.append(WEEKLY_DATA_MISSING)
         return
 
-    price = signal.get("price")
+    price = signal.get("strict_price")
 
     # 2) 주봉 30MA 아래
     if (STRICT_REQUIRE_PRICE_ABOVE_WEEKLY_30MA
@@ -186,12 +208,12 @@ def _check_weekly_stage(signal: Dict[str, Any],
     sig_type = signal.get("signal_type")
     if (sig_type == "BREAKOUT"
             and STRICT_REQUIRE_PRICE_ABOVE_DAILY_150MA):
-        ma150 = signal.get("ma150")
+        ma150 = signal.get("strict_ma150")
         if ma150 is not None and price is not None and price < ma150:
             reasons.append(BELOW_DAILY_150MA)
 
     # 4) Stage 3/4
-    weekly_stage = signal.get("weekly_stage")
+    weekly_stage = signal.get("strict_weekly_stage")
     if weekly_stage == "STAGE3":
         reasons.append(STAGE_STAGE3)
     elif weekly_stage == "STAGE4":
@@ -199,7 +221,7 @@ def _check_weekly_stage(signal: Dict[str, Any],
 
     # 5) STAGE2 인데 30W slope 음수 → 진짜 상승 아님
     if weekly_stage == "STAGE2":
-        slope = signal.get("slope30w")
+        slope = signal.get("strict_slope30w")
         if slope is not None and slope <= 0:
             reasons.append(WEEKLY_30MA_SLOPE_NEGATIVE)
 
@@ -246,8 +268,13 @@ def _check_volume(signal: Dict[str, Any],
     주봉 ≥ ``BREAKOUT_WEEKLY_VOL_RATIO``. 주봉 비율이 None(데이터 부족)
     이면 차단하지 않음 (Gate 3 의 weekly_data_missing 으로 흡수).
 
+    ``volume_ratio`` 는 detect_* 가 신호 시점 비율을 반환하므로 그대로 사용.
+    ``weekly_volume_ratio`` 는 last-bar 의 공개 필드 vs signal-date 스냅샷이
+    다르므로 ``strict_weekly_volume_ratio`` 사용.
+
     Args:
-        signal: 필요 키: signal_type, volume_ratio, weekly_volume_ratio.
+        signal: 필요 키: signal_type, volume_ratio (sig 값),
+                strict_weekly_volume_ratio.
     """
     if not STRICT_REQUIRE_BREAKOUT_VOLUME:
         return
@@ -258,7 +285,7 @@ def _check_volume(signal: Dict[str, Any],
     if vol_ratio is not None and vol_ratio < BREAKOUT_DAILY_VOL_RATIO:
         reasons.append(BREAKOUT_DAILY_VOLUME)
 
-    wvr = signal.get("weekly_volume_ratio")
+    wvr = signal.get("strict_weekly_volume_ratio")
     if wvr is not None and wvr < BREAKOUT_WEEKLY_VOL_RATIO:
         reasons.append(BREAKOUT_WEEKLY_VOLUME)
 
@@ -320,19 +347,24 @@ def _check_extension(signal: Dict[str, Any],
                      reasons: List[str]) -> None:
     """Gate 7 — Extension.
 
+    **모든 입력은 signal-date 스냅샷 필드(``strict_*``) 사용.** 공개
+    ``price``/``ma150``/``sma30w`` 는 last-bar 라 stale 신호의 extension
+    판단이 신호 *이후* 가격 변동에 오염됨.
+
     검사 항목:
-      - (price - ma150) / ma150 * 100 > BREAKOUT_MAX_EXTENDED_PCT (15%)
+      - (strict_price - strict_ma150) / strict_ma150 * 100 > BREAKOUT_MAX_EXTENDED_PCT
                                                  → "extended_above_ma150"
-      - BREAKOUT 만, (price - sma30w) / sma30w * 100 > 30%
+      - BREAKOUT 만,
+        (strict_price - strict_sma30w) / strict_sma30w * 100 > 30%
                                                  → "extended_above_30w"
 
     Args:
-        signal: 필요 키: signal_type, price, ma150, sma30w.
+        signal: 필요 키: signal_type, strict_price, strict_ma150, strict_sma30w.
     """
-    price = signal.get("price")
+    price = signal.get("strict_price")
 
     # MA150 대비 — 모든 signal_type 공통
-    ma150 = signal.get("ma150")
+    ma150 = signal.get("strict_ma150")
     if (price is not None and ma150 is not None and ma150 > 0):
         ext = (price - ma150) / ma150 * 100.0
         if ext > BREAKOUT_MAX_EXTENDED_PCT:
@@ -340,7 +372,7 @@ def _check_extension(signal: Dict[str, Any],
 
     # 30W SMA 대비 — BREAKOUT 만
     if signal.get("signal_type") == "BREAKOUT":
-        sma30w = signal.get("sma30w")
+        sma30w = signal.get("strict_sma30w")
         if (price is not None and sma30w is not None and sma30w > 0):
             ext_w = (price - sma30w) / sma30w * 100.0
             if ext_w > _EXT_30W_LIMIT_PCT:
@@ -354,23 +386,26 @@ def _check_stop_loss(signal: Dict[str, Any],
 
     검사 항목:
       - stop_loss is None + STRICT_REQUIRE_STOP_LOSS → "stop_loss_missing"
-      - stop_loss >= price (sanity, 항상 활성)        → "stop_loss_above_price"
+      - stop_loss >= strict_price (sanity, 항상 활성) → "stop_loss_above_price"
 
     sanity 검사는 STRICT_REQUIRE_STOP_LOSS 와 무관하게 항상 작동 — 잘못
-    계산된 stop 으로 매수 진입은 절대 허용 안 됨.
+    계산된 stop 으로 매수 진입은 절대 허용 안 됨. ``stop_loss`` 는 Phase 2
+    에서 signal-date close 기준으로 산출되므로, 비교 대상도 signal-date
+    종가인 ``strict_price`` 여야 일관됨 (last-bar 공개 ``price`` 비교 시
+    가격 급변 케이스에서 sanity 가 거짓 음성/양성을 낼 수 있음).
 
     Args:
-        signal: 필요 키: stop_loss, price.
+        signal: 필요 키: stop_loss, strict_price.
     """
     stop  = signal.get("stop_loss")
-    price = signal.get("price")
+    price = signal.get("strict_price")
 
     if stop is None:
         if STRICT_REQUIRE_STOP_LOSS:
             reasons.append(STOP_LOSS_MISSING)
         return
 
-    # sanity — stop_loss 가 매수가 이상이면 의미 없음
+    # sanity — stop_loss 가 signal 시점 종가 이상이면 의미 없음
     if price is not None and stop >= price:
         reasons.append(STOP_LOSS_ABOVE_PRICE)
 
