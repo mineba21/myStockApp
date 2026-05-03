@@ -324,12 +324,22 @@
               :class="r.strict_filter_passed===true?'bg-emerald-100 text-emerald-700':r.strict_filter_passed===false?'bg-red-100 text-red-700':'bg-slate-100 text-slate-500'"
               :title="r.strict_filter_passed===true?'Strict Weinstein 8 게이트 통과':r.strict_filter_passed===false?'Strict Weinstein 게이트 거부 — 매수 후보 아님':'Legacy 결과 (strict 평가 이전)'"
               x-text="r.strict_filter_passed===true?'✓ Strict':r.strict_filter_passed===false?'✗ 거부':'Strict —'"></span>
-            <!-- RS 배지 (Mansfield RS — rs_value, rs_trend) -->
-            <template x-if="(r.rs_value!=null) || (r.rs!=null)">
+            <!-- Mansfield RS 배지 — rs_value 는 (ratio/SMA52−1)*100 의 0선 기준 퍼센트.
+                 strict gate 는 rs_value≥0 을 요구. Legacy ratio RS(r.rs, ~1.0 기준 배수)
+                 와는 스케일이 다르므로 분기 렌더링.
+                 색상 기준: ≥+5 강함(orange) / ≥0 중립(slate) / <0 약함·strict 거부 후보(red). -->
+            <template x-if="r.rs_value!=null">
               <span class="text-xs px-2 py-0.5 rounded-full font-semibold"
-                :class="(r.rs_value??r.rs)>=1.5?'bg-orange-100 text-orange-700':(r.rs_value??r.rs)>=1?'bg-slate-100 text-slate-600':'bg-slate-50 text-slate-400'"
-                :title="'Mansfield RS '+(r.rs_value??r.rs)+(r.rs_trend?(' · 추세: '+r.rs_trend):'')"
-                x-text="'RS '+(r.rs_value??r.rs)+'x'+(r.rs_trend==='RISING'?' ↗':r.rs_trend==='FALLING'?' ↘':'')"></span>
+                :class="r.rs_value>=5?'bg-orange-100 text-orange-700':r.rs_value>=0?'bg-slate-100 text-slate-600':'bg-red-50 text-red-600'"
+                :title="'Mansfield RS '+(r.rs_value>=0?'+':'')+r.rs_value.toFixed(1)+' (vs 시장, 0선 기준)'+(r.rs_trend?' · 추세: '+r.rs_trend:'')"
+                x-text="'MRS '+(r.rs_value>=0?'+':'')+r.rs_value.toFixed(1)+(r.rs_trend==='RISING'?' ↗':r.rs_trend==='FALLING'?' ↘':'')"></span>
+            </template>
+            <!-- Legacy ratio RS (r.rs, ~1.0 기준 배수) — rs_value 부재 시 fallback -->
+            <template x-if="r.rs_value==null && r.rs!=null">
+              <span class="text-xs px-2 py-0.5 rounded-full font-semibold"
+                :class="r.rs>=1.5?'bg-orange-100 text-orange-700':r.rs>=1?'bg-slate-100 text-slate-600':'bg-slate-50 text-slate-400'"
+                :title="'상대강도 비율: 시장 대비 '+r.rs+'배 (legacy ratio RS)'"
+                x-text="'RS '+r.rs+'x'"></span>
             </template>
             <!-- Grade 배지 (S/A/B 종합 등급 — 채워진 경우만) -->
             <template x-if="r.grade">
