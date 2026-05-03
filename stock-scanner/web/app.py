@@ -2,6 +2,7 @@
 FastAPI 웹 애플리케이션
 """
 
+import json
 import logging
 import re
 import threading
@@ -11,6 +12,7 @@ from fastapi import FastAPI, Request, Depends, HTTPException, BackgroundTasks, Q
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import pytz
@@ -81,21 +83,50 @@ async def get_scan_status():
     return {**scan_status, "now_kst": now_kst, "next_schedules": get_next_run_times()}
 
 
+def _parse_filter_reasons(raw: Optional[str]) -> List[str]:
+    """`filter_reasons` 컬럼은 JSON 문자열(plan D5). 파싱 실패 시 빈 리스트."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
 @app.get("/api/results")
 async def get_results(market: str = "ALL", signal_type: str = "ALL",
-                      days: int = 7, limit: int = 200, db: Session = Depends(get_db)):
+                      days: int = 7, limit: int = 200,
+                      include_rejected: bool = False,
+                      db: Session = Depends(get_db)):
+    """스캔 결과 조회.
+
+    기본값(`include_rejected=False`)은 strict-pass(True) 또는 strict 평가 이전의
+    legacy 행(NULL)만 반환한다. `STRICT_PERSIST_REJECTED=True`로 저장된 거부
+    신호(strict_filter_passed=False)는 일반 매수 후보로 노출되지 않는다.
+    QA·백테스팅에서 거부 신호까지 함께 보려면 `include_rejected=true` opt-in.
+    """
     since_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
     q = db.query(ScanResult).filter(ScanResult.signal_date >= since_str)
     if market != "ALL":
         q = q.filter(ScanResult.market == market)
     if signal_type != "ALL":
         q = q.filter(ScanResult.signal_type == signal_type)
+    if not include_rejected:
+        # NULL = legacy(strict 도입 이전 또는 strict OFF), True = strict-pass.
+        # False(거부)만 제외.
+        q = q.filter(or_(
+            ScanResult.strict_filter_passed.is_(None),
+            ScanResult.strict_filter_passed.is_(True),
+        ))
     rows = q.order_by(ScanResult.signal_date.desc(), ScanResult.scan_time.desc()).limit(limit).all()
     return [{"id": r.id, "scan_time": r.scan_time.isoformat(),
              "market": r.market, "ticker": r.ticker, "name": r.name,
              "signal_type": r.signal_type, "stage": r.stage,
              "price": r.price, "ma150": r.ma150,
-             "volume_ratio": r.volume_ratio, "signal_date": r.signal_date}
+             "volume_ratio": r.volume_ratio, "signal_date": r.signal_date,
+             "strict_filter_passed": r.strict_filter_passed,
+             "filter_reasons": _parse_filter_reasons(r.filter_reasons)}
             for r in rows]
 
 
@@ -114,10 +145,12 @@ async def delete_results_bulk(
     market: str = "ALL",
     signal_type: str = "ALL",
     days: int = 0,
+    include_rejected: bool = False,
     db: Session = Depends(get_db),
 ):
     """현재 필터 조건에 맞는 스캔 결과 일괄 삭제.
     days=0 이면 날짜 필터 없이 전체 삭제.
+    `include_rejected=False`(기본): strict 거부 행(QA용)은 보존.
     """
     q = db.query(ScanResult)
     if market != "ALL":
@@ -127,6 +160,11 @@ async def delete_results_bulk(
     if days > 0:
         since_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
         q = q.filter(ScanResult.signal_date >= since_str)
+    if not include_rejected:
+        q = q.filter(or_(
+            ScanResult.strict_filter_passed.is_(None),
+            ScanResult.strict_filter_passed.is_(True),
+        ))
     count = q.count()
     q.delete(synchronize_session=False)
     db.commit()
