@@ -64,7 +64,9 @@ def client_with_db(monkeypatch):
 
 
 def _insert_result(session_factory, *, ticker, strict_filter_passed, filter_reasons=None,
-                   market="US", signal_type="BREAKOUT", days_ago=0, sector_name=None):
+                   market="US", signal_type="BREAKOUT", days_ago=0, sector_name=None,
+                   sector_stage=None, grade=None, signal_quality=None,
+                   rs_value=None, rs_trend=None, pivot_price=None, stop_loss=None):
     """ScanResult 한 행 삽입 후 id 반환."""
     from database.models import ScanResult
 
@@ -86,6 +88,13 @@ def _insert_result(session_factory, *, ticker, strict_filter_passed, filter_reas
             filter_reasons=(json.dumps(filter_reasons)
                             if filter_reasons is not None else None),
             sector_name=sector_name,
+            sector_stage=sector_stage,
+            grade=grade,
+            signal_quality=signal_quality,
+            rs_value=rs_value,
+            rs_trend=rs_trend,
+            pivot_price=pivot_price,
+            stop_loss=stop_loss,
         )
         db.add(row)
         db.commit()
@@ -166,6 +175,40 @@ class TestResultsRejectedFilter:
         assert "sector_name" in rows["WITHOUT_SECTOR"]
         assert rows["WITHOUT_SECTOR"]["sector_name"] is None
         assert rows["WITH_SECTOR"]["sector_name"] == "Technology"
+
+    def test_response_exposes_strict_meta_fields(self, client_with_db):
+        """API 응답이 sector_stage / grade / signal_quality / rs_value / rs_trend /
+        pivot_price / stop_loss 도 노출 (UI 카드 보강용).
+
+        값이 채워진 경우 그대로, 비어 있는 경우(legacy 또는 sector 매핑 미배포)
+        에도 키 자체는 응답에 항상 존재해야 한다 — UI 가 graceful fallback 가능.
+        """
+        client, session = client_with_db
+        _insert_result(session, ticker="RICH", strict_filter_passed=True,
+                       sector_stage="STAGE2", grade="A", signal_quality="STRONG",
+                       rs_value=1.42, rs_trend="RISING",
+                       pivot_price=99.5, stop_loss=88.0)
+        _insert_result(session, ticker="BARE", strict_filter_passed=None)
+
+        r = client.get("/api/results")
+        assert r.status_code == 200
+        rows = {row["ticker"]: row for row in r.json()}
+
+        rich = rows["RICH"]
+        assert rich["sector_stage"] == "STAGE2"
+        assert rich["grade"] == "A"
+        assert rich["signal_quality"] == "STRONG"
+        assert rich["rs_value"] == 1.42
+        assert rich["rs_trend"] == "RISING"
+        assert rich["pivot_price"] == 99.5
+        assert rich["stop_loss"] == 88.0
+
+        bare = rows["BARE"]
+        # 키는 항상 존재 — graceful fallback 위해
+        for key in ("sector_stage", "grade", "signal_quality",
+                    "rs_value", "rs_trend", "pivot_price", "stop_loss"):
+            assert key in bare, f"{key} 키가 응답에 없으면 UI graceful fallback 깨짐"
+            assert bare[key] is None
 
     def test_filter_reasons_parsed_as_json_list(self, client_with_db):
         """filter_reasons 는 DB에 JSON 문자열로 저장되어도 API 는 리스트로 반환."""
