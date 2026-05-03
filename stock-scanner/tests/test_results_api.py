@@ -64,7 +64,7 @@ def client_with_db(monkeypatch):
 
 
 def _insert_result(session_factory, *, ticker, strict_filter_passed, filter_reasons=None,
-                   market="US", signal_type="BREAKOUT", days_ago=0):
+                   market="US", signal_type="BREAKOUT", days_ago=0, sector_name=None):
     """ScanResult 한 행 삽입 후 id 반환."""
     from database.models import ScanResult
 
@@ -85,6 +85,7 @@ def _insert_result(session_factory, *, ticker, strict_filter_passed, filter_reas
             strict_filter_passed=strict_filter_passed,
             filter_reasons=(json.dumps(filter_reasons)
                             if filter_reasons is not None else None),
+            sector_name=sector_name,
         )
         db.add(row)
         db.commit()
@@ -146,6 +147,25 @@ class TestResultsRejectedFilter:
         assert rows["PASS"]["filter_reasons"] == []
         assert rows["LEGACY"]["strict_filter_passed"] is None
         assert rows["LEGACY"]["filter_reasons"] == []  # NULL → 빈 리스트
+
+    def test_response_exposes_sector_name(self, client_with_db):
+        """API 응답이 sector_name 을 명시적으로 노출 (NULL 도 키로 존재).
+
+        UI sector 배지가 자연스럽게 fallback 하려면 키 자체는 항상 응답에 있어야
+        한다. 후속 sector 매핑 plan 머지 시 값이 채워지면 UI 가 자동 활성.
+        """
+        client, session = client_with_db
+        _insert_result(session, ticker="WITHOUT_SECTOR", strict_filter_passed=True)
+        _insert_result(session, ticker="WITH_SECTOR", strict_filter_passed=True,
+                       sector_name="Technology")
+
+        r = client.get("/api/results")
+        assert r.status_code == 200
+        rows = {row["ticker"]: row for row in r.json()}
+
+        assert "sector_name" in rows["WITHOUT_SECTOR"]
+        assert rows["WITHOUT_SECTOR"]["sector_name"] is None
+        assert rows["WITH_SECTOR"]["sector_name"] == "Technology"
 
     def test_filter_reasons_parsed_as_json_list(self, client_with_db):
         """filter_reasons 는 DB에 JSON 문자열로 저장되어도 API 는 리스트로 반환."""

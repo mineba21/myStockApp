@@ -126,7 +126,8 @@ async def get_results(market: str = "ALL", signal_type: str = "ALL",
              "price": r.price, "ma150": r.ma150,
              "volume_ratio": r.volume_ratio, "signal_date": r.signal_date,
              "strict_filter_passed": r.strict_filter_passed,
-             "filter_reasons": _parse_filter_reasons(r.filter_reasons)}
+             "filter_reasons": _parse_filter_reasons(r.filter_reasons),
+             "sector_name": r.sector_name}
             for r in rows]
 
 
