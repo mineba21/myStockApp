@@ -125,8 +125,18 @@ async def get_results(market: str = "ALL", signal_type: str = "ALL",
              "signal_type": r.signal_type, "stage": r.stage,
              "price": r.price, "ma150": r.ma150,
              "volume_ratio": r.volume_ratio, "signal_date": r.signal_date,
+             # Strict Weinstein 메타데이터 (Phase 4 P2 + UI Phase)
              "strict_filter_passed": r.strict_filter_passed,
-             "filter_reasons": _parse_filter_reasons(r.filter_reasons)}
+             "filter_reasons": _parse_filter_reasons(r.filter_reasons),
+             "sector_name": r.sector_name,
+             "sector_stage": r.sector_stage,
+             # 부가 메타데이터 (UI 카드 보강용 — 후방 호환 유지)
+             "grade": r.grade,
+             "signal_quality": r.signal_quality,
+             "rs_value": r.rs_value,
+             "rs_trend": r.rs_trend,
+             "pivot_price": r.pivot_price,
+             "stop_loss": r.stop_loss}
             for r in rows]
 
 

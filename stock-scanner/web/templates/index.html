@@ -216,6 +216,12 @@
       <option value="30">30일</option>
     </select>
     <button @click="loadResults()" class="btn btn-ghost">↺ 새로고침</button>
+    <!-- Strict 거부 행 opt-in (세션 한정 — 새로고침 시 OFF 리셋) -->
+    <label class="inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded-md border border-slate-200 bg-white text-slate-600 cursor-pointer hover:bg-slate-50"
+           title="Strict Weinstein 거부 신호 (QA·백테스팅용) 도 결과에 포함. 매수/감시 버튼은 자동 비활성.">
+      <input type="checkbox" x-model="filter.include_rejected" @change="loadResults()" class="accent-red-500">
+      <span>👁 거부 신호 보기 <span class="text-slate-400">(QA)</span></span>
+    </label>
     <button x-show="results.length > 0"
       @click="showBulkDeleteModal = true"
       class="btn btn-danger ml-auto flex items-center gap-1.5">
@@ -225,6 +231,18 @@
             x-text="results.length + '건'"></span>
     </button>
   </div>
+
+  <!-- QA 모드 안내 배너 — include_rejected ON 일 때만 -->
+  <template x-if="filter.include_rejected">
+    <div class="bg-amber-50 text-amber-700 text-xs px-3 py-2 rounded-md mb-3 flex items-center gap-2">
+      <span>⚠️</span>
+      <span>
+        QA 모드: Strict 거부 신호
+        <span class="font-semibold" x-text="results.filter(r => r.strict_filter_passed === false).length + '건'"></span>
+        포함 — 매수/감시 동선 비활성됨
+      </span>
+    </div>
+  </template>
 
   <!-- 일괄 삭제 확인 모달 -->
   <div x-show="showBulkDeleteModal" x-cloak class="modal-bg" @click.self="showBulkDeleteModal=false">
@@ -251,6 +269,12 @@
             <span class="text-slate-400">기간</span>
             <span class="font-medium text-slate-700" x-text="filter.days+'일 이내'"></span>
           </div>
+          <template x-if="filter.include_rejected">
+            <div class="flex justify-between text-amber-600">
+              <span>거부 행 포함</span>
+              <span class="font-medium">QA 모드</span>
+            </div>
+          </template>
         </div>
         <p class="text-xs text-red-400 mt-3">⚠️ 삭제 후 복구할 수 없습니다</p>
       </div>
@@ -281,7 +305,10 @@
   <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
     <template x-for="r in results" :key="r.id">
       <div class="rounded-xl p-4 border relative"
-        :class="r.signal_type==='BREAKOUT'?'sig-b':r.signal_type==='RE_BREAKOUT'?'border-purple-200 bg-purple-50/60':'sig-r'">
+        :class="[
+          r.signal_type==='BREAKOUT'?'sig-b':r.signal_type==='RE_BREAKOUT'?'border-purple-200 bg-purple-50/60':'sig-r',
+          r.strict_filter_passed===false ? 'opacity-60 ring-1 ring-red-200' : ''
+        ]">
         <button @click="deleteResult(r.id)" title="삭제"
           class="absolute top-2 right-2 w-5 h-5 flex items-center justify-center rounded-full text-slate-300 hover:text-red-500 hover:bg-red-50 transition text-sm leading-none">×</button>
         <div class="flex justify-between items-start mb-2 pr-5">
@@ -292,12 +319,39 @@
             <span class="text-xs px-2 py-0.5 rounded-full font-semibold"
               :class="r.signal_type==='BREAKOUT'?'bg-emerald-100 text-emerald-700':r.signal_type==='RE_BREAKOUT'?'bg-purple-100 text-purple-700':'bg-blue-100 text-blue-700'"
               x-text="r.signal_type==='BREAKOUT'?'🚀 돌파':r.signal_type==='RE_BREAKOUT'?'🔁 재돌파':'🔄 반등'"></span>
-            <!-- RS 배지 -->
-            <template x-if="r.rs!=null">
+            <!-- Strict Weinstein 필터 상태 배지 (3 상태: pass / reject / legacy) -->
+            <span class="text-xs px-2 py-0.5 rounded-full font-semibold"
+              :class="r.strict_filter_passed===true?'bg-emerald-100 text-emerald-700':r.strict_filter_passed===false?'bg-red-100 text-red-700':'bg-slate-100 text-slate-500'"
+              :title="r.strict_filter_passed===true?'Strict Weinstein 8 게이트 통과':r.strict_filter_passed===false?'Strict Weinstein 게이트 거부 — 매수 후보 아님':'Legacy 결과 (strict 평가 이전)'"
+              x-text="r.strict_filter_passed===true?'✓ Strict':r.strict_filter_passed===false?'✗ 거부':'Strict —'"></span>
+            <!-- Mansfield RS 배지 — rs_value 는 (ratio/SMA52−1)*100 의 0선 기준 퍼센트.
+                 strict gate 는 rs_value≥0 을 요구. Legacy ratio RS(r.rs, ~1.0 기준 배수)
+                 와는 스케일이 다르므로 분기 렌더링.
+                 색상 기준: ≥+5 강함(orange) / ≥0 중립(slate) / <0 약함·strict 거부 후보(red). -->
+            <template x-if="r.rs_value!=null">
+              <span class="text-xs px-2 py-0.5 rounded-full font-semibold"
+                :class="r.rs_value>=5?'bg-orange-100 text-orange-700':r.rs_value>=0?'bg-slate-100 text-slate-600':'bg-red-50 text-red-600'"
+                :title="'Mansfield RS '+(r.rs_value>=0?'+':'')+r.rs_value.toFixed(1)+' (vs 시장, 0선 기준)'+(r.rs_trend?' · 추세: '+r.rs_trend:'')"
+                x-text="'MRS '+(r.rs_value>=0?'+':'')+r.rs_value.toFixed(1)+(r.rs_trend==='RISING'?' ↗':r.rs_trend==='FALLING'?' ↘':'')"></span>
+            </template>
+            <!-- Legacy ratio RS (r.rs, ~1.0 기준 배수) — rs_value 부재 시 fallback -->
+            <template x-if="r.rs_value==null && r.rs!=null">
               <span class="text-xs px-2 py-0.5 rounded-full font-semibold"
                 :class="r.rs>=1.5?'bg-orange-100 text-orange-700':r.rs>=1?'bg-slate-100 text-slate-600':'bg-slate-50 text-slate-400'"
-                :title="'상대강도: 시장 대비 '+r.rs+'배 수익률 (13주)'"
+                :title="'상대강도 비율: 시장 대비 '+r.rs+'배 (legacy ratio RS)'"
                 x-text="'RS '+r.rs+'x'"></span>
+            </template>
+            <!-- Grade 배지 (S/A/B 종합 등급 — 채워진 경우만) -->
+            <template x-if="r.grade">
+              <span class="text-xs px-2 py-0.5 rounded-full font-semibold"
+                :class="r.grade==='S'?'bg-amber-100 text-amber-700':r.grade==='A'?'bg-emerald-50 text-emerald-700':'bg-slate-100 text-slate-600'"
+                :title="'종합 등급 '+r.grade"
+                x-text="r.grade"></span>
+            </template>
+            <!-- Sector 배지 (sector_name truthy 일 때만 — NULL 이면 미렌더) -->
+            <template x-if="r.sector_name">
+              <span class="text-xs px-2 py-0.5 rounded-full font-semibold bg-indigo-50 text-indigo-700"
+                x-text="r.sector_name"></span>
             </template>
           </div>
           <span class="text-xs text-slate-400 flex-shrink-0">
@@ -321,17 +375,41 @@
               x-text="(r.volume_ratio||0).toFixed(1)+'x'"></div>
           </div>
         </div>
+        <!-- 거부 사유 펼치기 (strict 거부 행만) -->
+        <template x-if="r.strict_filter_passed === false && (r.filter_reasons||[]).length">
+          <div class="mb-2">
+            <button @click="r._reasonsOpen = !r._reasonsOpen"
+              class="text-xs text-red-600 hover:text-red-700 font-medium inline-flex items-center gap-1">
+              <span>📋 거부 사유</span>
+              <span x-text="r.filter_reasons.length"></span><span>개</span>
+              <span x-text="r._reasonsOpen ? '▴' : '▾'"></span>
+            </button>
+            <div x-show="r._reasonsOpen" x-cloak class="mt-1.5 flex flex-wrap gap-1">
+              <template x-for="reason in r.filter_reasons" :key="reason">
+                <span class="bg-red-50 text-red-700 text-[11px] px-1.5 py-0.5 rounded"
+                      :title="reason"
+                      x-text="reasonLabel(reason)"></span>
+              </template>
+            </div>
+          </div>
+        </template>
         <div class="flex gap-2">
           <button @click="openChart(r)"
             class="flex-1 text-xs bg-white/80 hover:bg-white border border-slate-200 rounded-lg py-1.5 text-slate-600 hover:text-emerald-600 transition font-medium">
             📈 차트
           </button>
           <button @click="openAddTxFromScan(r)"
-            class="flex-1 text-xs bg-white/80 hover:bg-white border border-slate-200 rounded-lg py-1.5 text-slate-600 hover:text-indigo-600 transition font-medium">
+            :disabled="r.strict_filter_passed === false"
+            :title="r.strict_filter_passed === false ? 'Strict 거부 행은 매수 동선 차단 (QA 인스펙트 전용)' : ''"
+            class="flex-1 text-xs bg-white/80 hover:bg-white border border-slate-200 rounded-lg py-1.5 text-slate-600 hover:text-indigo-600 transition font-medium"
+            :class="r.strict_filter_passed === false ? 'opacity-50 cursor-not-allowed pointer-events-none' : ''">
             + 매수
           </button>
           <button @click="openAddWatch(r)"
-            class="flex-1 text-xs bg-white/80 hover:bg-white border border-slate-200 rounded-lg py-1.5 text-slate-600 hover:text-amber-600 transition font-medium">
+            :disabled="r.strict_filter_passed === false"
+            :title="r.strict_filter_passed === false ? 'Strict 거부 행은 감시 추가 차단 (QA 인스펙트 전용)' : ''"
+            class="flex-1 text-xs bg-white/80 hover:bg-white border border-slate-200 rounded-lg py-1.5 text-slate-600 hover:text-amber-600 transition font-medium"
+            :class="r.strict_filter_passed === false ? 'opacity-50 cursor-not-allowed pointer-events-none' : ''">
             👁 감시
           </button>
         </div>
@@ -1238,6 +1316,38 @@
 
 <!-- ══════════════════ Alpine.js 앱 ═══════════════════ -->
 <script>
+// Strict Weinstein filter reason 한국어 라벨 매핑.
+// 백엔드 enum 은 stable identifier 로 둠 → UI 라벨 변경 시 백엔드 재배포 불필요.
+// 신규 reason 추가 시 이 매핑도 함께 업데이트. 미매핑 키는 raw enum 그대로 fallback.
+// Source: scanner/strict_filter.py (23 reasons).
+const REASON_LABELS_KO = {
+  market_bear:                '시장 BEAR — 신규 매수 차단',
+  market_unknown:             '시장 데이터 부재',
+  market_caution_breakout:    'CAUTION 시장에서 돌파 차단',
+  sector_stage4:              '섹터 Stage 4 (하락)',
+  sector_not_stage2:          '섹터 Stage 2 아님',
+  weekly_data_missing:        '주봉 데이터 부재',
+  below_weekly_30ma:          '주봉 30MA 미달',
+  below_daily_150ma:          '일봉 150MA 미달',
+  stage_stage3:               '종목 Stage 3 (분배)',
+  stage_stage4:               '종목 Stage 4 (하락)',
+  weekly_30ma_slope_negative: '30주 MA 기울기 음수',
+  base_insufficient:          'Base 기간 부족',
+  base_too_wide:              'Base 폭 과대 (>15%)',
+  rebound_no_retest:          '리테스트 없는 반등',
+  breakout_daily_volume:      '돌파일 일봉 거래량 미달',
+  breakout_weekly_volume:     '돌파주 주봉 거래량 미달',
+  rs_below_zero:              'Mansfield RS < 0',
+  rs_falling:                 'RS 추세 하락',
+  rs_benchmark_missing:       'RS 벤치마크 부재',
+  rs_no_zero_cross:           'RS 0선 음→양 전환 없음',
+  extended_above_ma150:       'MA150 +15% 초과 과열',
+  extended_above_30w:         '30주 MA 대비 30%+ 과열',
+  stop_loss_missing:          '손절가 산출 실패',
+  stop_loss_above_price:      '손절가가 현재가 이상(비정상)',
+};
+function reasonLabel(key) { return REASON_LABELS_KO[key] || key; }
+
 function app() {
   return {
     nowKst: '', activeTab: 'scan',
@@ -1256,7 +1366,8 @@ function app() {
     usUniverse: 'sp500+nasdaq100',
     scanProg: {progress:0,total:0,current_stock:''},
     results: [], scanLogs: [], nextSchedules: [],
-    filter: {market:'ALL', signal_type:'ALL', days:7},
+    // include_rejected: 세션 한정 (새로고침 시 OFF 리셋 — localStorage 미사용)
+    filter: {market:'ALL', signal_type:'ALL', days:7, include_rejected:false},
     stats: {buy:0,breakout:0,rebreakout:0,rebound:0,kr:0,us:0},
     marketStatus: {},
     settings: {},
@@ -1355,14 +1466,21 @@ function app() {
 
     async loadResults() {
       try {
-        const {market,signal_type,days} = this.filter;
-        this.results = await (await fetch(`/api/results?market=${market}&signal_type=${signal_type}&days=${days}&limit=200`)).json();
-        this.stats.buy=this.results.length;
-        this.stats.breakout=this.results.filter(r=>r.signal_type==='BREAKOUT').length;
-        this.stats.rebreakout=this.results.filter(r=>r.signal_type==='RE_BREAKOUT').length;
-        this.stats.rebound=this.results.filter(r=>r.signal_type==='REBOUND').length;
-        this.stats.kr=this.results.filter(r=>r.market==='KR').length;
-        this.stats.us=this.results.filter(r=>r.market==='US').length;
+        const {market,signal_type,days,include_rejected} = this.filter;
+        const inc = include_rejected ? '&include_rejected=true' : '';
+        const data = await (await fetch(`/api/results?market=${market}&signal_type=${signal_type}&days=${days}&limit=200${inc}`)).json();
+        // 거부 사유 펼침 상태(_reasonsOpen)는 카드별 로컬 토글 — 응답에 포함되지 않음.
+        this.results = data.map(r => ({...r, _reasonsOpen: false}));
+
+        // stats 는 strict-pass 의미를 보전 — 거부 행은 카운트에서 제외.
+        // (토글 ON 으로 결과 그리드에 거부가 섞여도 통계는 pass + legacy 만 집계)
+        const buyable = this.results.filter(r => r.strict_filter_passed !== false);
+        this.stats.buy=buyable.length;
+        this.stats.breakout=buyable.filter(r=>r.signal_type==='BREAKOUT').length;
+        this.stats.rebreakout=buyable.filter(r=>r.signal_type==='RE_BREAKOUT').length;
+        this.stats.rebound=buyable.filter(r=>r.signal_type==='REBOUND').length;
+        this.stats.kr=buyable.filter(r=>r.market==='KR').length;
+        this.stats.us=buyable.filter(r=>r.market==='US').length;
       } catch{}
     },
 
@@ -1376,8 +1494,9 @@ function app() {
       if (this.bulkDeleting) return;
       this.bulkDeleting = true;
       try {
-        const {market, signal_type, days} = this.filter;
-        const url = `/api/results?market=${market}&signal_type=${signal_type}&days=${days}`;
+        const {market, signal_type, days, include_rejected} = this.filter;
+        const inc = include_rejected ? '&include_rejected=true' : '';
+        const url = `/api/results?market=${market}&signal_type=${signal_type}&days=${days}${inc}`;
         const r = await fetch(url, {method:'DELETE'});
         if (r.ok) {
           const d = await r.json();
