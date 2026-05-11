@@ -106,8 +106,12 @@ async def get_results(market: str = "ALL", signal_type: str = "ALL",
     신호(strict_filter_passed=False)는 일반 매수 후보로 노출되지 않는다.
     QA·백테스팅에서 거부 신호까지 함께 보려면 `include_rejected=true` opt-in.
     """
-    since_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
-    q = db.query(ScanResult).filter(ScanResult.signal_date >= since_str)
+    # days 는 "스캔이 실행된 시점" 기준 (signal_date 가 아닌 scan_time).
+    # detector(SCAN_LOOKBACK_DAYS=7) 는 과거 거래일 bar 에서도 돌파를 찾으므로,
+    # signal_date 기준 calendar-day 필터로는 방금 스캔한 fresh 결과도 가려질 수 있다.
+    # signal_date 는 카드 라벨로 그대로 노출되어 별도 필터 없이도 가시화됨.
+    since_dt = datetime.utcnow() - timedelta(days=days)
+    q = db.query(ScanResult).filter(ScanResult.scan_time >= since_dt)
     if market != "ALL":
         q = q.filter(ScanResult.market == market)
     if signal_type != "ALL":
@@ -168,8 +172,9 @@ async def delete_results_bulk(
     if signal_type != "ALL":
         q = q.filter(ScanResult.signal_type == signal_type)
     if days > 0:
-        since_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
-        q = q.filter(ScanResult.signal_date >= since_str)
+        # GET /api/results 와 동일하게 scan_time 기준.
+        since_dt = datetime.utcnow() - timedelta(days=days)
+        q = q.filter(ScanResult.scan_time >= since_dt)
     if not include_rejected:
         q = q.filter(or_(
             ScanResult.strict_filter_passed.is_(None),

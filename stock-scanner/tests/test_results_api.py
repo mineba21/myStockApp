@@ -210,6 +210,40 @@ class TestResultsRejectedFilter:
             assert key in bare, f"{key} 키가 응답에 없으면 UI graceful fallback 깨짐"
             assert bare[key] is None
 
+    def test_days_filter_uses_scan_time_not_signal_date(self, client_with_db):
+        """`days` 필터는 scan_time(검출 시각) 기준 — signal_date(돌파 bar 거래일)가
+        며칠 전이어도 방금 스캔에서 검출됐으면 결과에 포함돼야 한다.
+
+        Regression: 2026-05-11 21:25 US 스캔(scan_log id=37, 14건 strict-pass)이
+        signal_date 분포 2026-04-23 ~ 2026-05-07 이라 days=3 (>= '2026-05-08')
+        필터로 UI 에 0건 노출되던 버그.
+        """
+        client, session = client_with_db
+
+        # _insert_result 헬퍼는 scan_time/signal_date 를 같은 days_ago 로 묶기 때문에
+        # signal_date 만 따로 과거로 두는 케이스는 raw insert 로 구성.
+        from database.models import ScanResult
+        db = session()
+        try:
+            db.add(ScanResult(
+                scan_time=datetime.utcnow(),                                  # 방금 스캔
+                market="US", ticker="OLDBREAK", name="Old Breakout Inc.",
+                signal_type="BREAKOUT", stage="STAGE2",
+                price=100.0, ma150=90.0, volume_ratio=2.5,
+                # 돌파 bar 는 10일 전 거래일 (detector 의 SCAN_LOOKBACK_DAYS 윈도우 모사)
+                signal_date=(datetime.utcnow() - timedelta(days=10)).strftime("%Y-%m-%d"),
+                strict_filter_passed=True,
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        r = client.get("/api/results?days=3")
+        assert r.status_code == 200
+        tickers = {row["ticker"] for row in r.json()}
+        assert "OLDBREAK" in tickers, \
+            "signal_date 가 10일 전이라도 방금 스캔됐으면 days=3 에서 보여야 한다"
+
     def test_filter_reasons_parsed_as_json_list(self, client_with_db):
         """filter_reasons 는 DB에 JSON 문자열로 저장되어도 API 는 리스트로 반환."""
         client, session = client_with_db
