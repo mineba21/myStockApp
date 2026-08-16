@@ -1,0 +1,49 @@
+name: US Stock Scan
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # UTC 기준
+    # 미국장 종료 후 여유 있게 실행
+    # 예: KST 07:30 = UTC 22:30
+    - cron: "30 22 * * 1-5"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: stock-scanner
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run US scan
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
+          KIS_ACCOUNT_PROD_CD: ${{ secrets.KIS_ACCOUNT_PROD_CD }}
+
+        run: |
+          python -c "
+          from scanner.scan_engine import run_scan
+          run_scan(market='US', triggered_by='github_actions')
+          "
