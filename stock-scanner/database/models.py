@@ -201,6 +201,8 @@ def init_db():
 
 
 def _migrate():
+    if not DATABASE_URL.startswith("sqlite"):
+        return
     """기존 DB에 새 컬럼이 없으면 추가 (ALTER TABLE)"""
     from sqlalchemy import text as _text
     with engine.connect() as conn:
