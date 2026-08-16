@@ -105,8 +105,8 @@ KIS_ACCOUNT_PROD_CD = os.getenv("KIS_ACCOUNT_PROD_CD", "01")
 KIS_IS_PAPER        = os.getenv("KIS_IS_PAPER", "true").lower() == "true"
 
 
-DATABASE_URL="postgresql://neondb_owner:npg_fNF9Br0QMwZK@ep-royal-boat-azylbbj2-pooler.c-3.ap-southeast-1.aws.neon.tech/stocks?sslmode=require&channel_binding=require"
-DATABASE_DIRECT_URL="postgresql://neondb_owner:npg_fNF9Br0QMwZK@ep-royal-boat-azylbbj2.c-3.ap-southeast-1.aws.neon.tech/stocks?sslmode=require&channel_binding=require"
+DATABASE_URL=os.getenv("DATABASE_URL", "")
+DATABASE_DIRECT_URL=os.getenv("DATABASE_DIRECT_URL", "")
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
